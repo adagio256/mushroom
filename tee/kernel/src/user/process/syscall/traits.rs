@@ -39,6 +39,7 @@ where
 }
 
 impl SyscallArg for u32 {
+    #[track_caller]
     fn parse(value: u64) -> Result<Self> {
         Ok(u32::try_from(value)?)
     }
@@ -640,7 +641,7 @@ impl SyscallHandlers {
             .copied()
             .flatten()
             .ok_or_else(|| {
-                warn!("unsupported syscall: {syscall_no}");
+                // warn!("unsupported syscall: {syscall_no}");
                 Error::no_sys(())
             })?;
 
@@ -658,7 +659,7 @@ impl SyscallHandlers {
             vm_activator: RefCell::new(vm_activator),
         };
 
-        if !matches!(syscall_no, 0 | 1) && guard.tid() != 1 {
+        if !matches!(syscall_no, 202) && guard.tid() != 1 || matches!(res, SyscallResult::Err(_)) {
             trace!(
                 "core={} tid={} @ {formatted_syscall} = {res:?}",
                 PerCpu::get().idx,

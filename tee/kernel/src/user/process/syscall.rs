@@ -4,15 +4,18 @@ use core::{
     fmt::{self},
     mem::size_of,
     num::NonZeroU32,
+    ops::Not,
 };
 
 use alloc::{sync::Arc, vec::Vec};
-use bytemuck::{bytes_of, bytes_of_mut, Zeroable};
+use bytemuck::{bytes_of, bytes_of_mut, checked::try_pod_read_unaligned, Zeroable};
 use kernel_macros::syscall;
+use log::debug;
 use x86_64::VirtAddr;
 
 use crate::{
-    error::{Error, Result},
+    async_io::{try_io, Blocking, RequiresRetry},
+    error::{Error, ErrorKind, Result},
     fs::node::{
         self, create_directory, create_file, create_link,
         devtmpfs::{self, RandomFile},
@@ -20,15 +23,16 @@ use crate::{
         unlink_file, Directory, Node, ROOT_NODE,
     },
     time,
-    user::process::memory::MemoryPermissions,
+    user::process::{memory::MemoryPermissions, syscall::args::EpollEvents},
 };
 
 use self::{
     args::{
-        Advice, ArchPrctlCode, ClockId, CloneFlags, CopyFileRangeFlags, FcntlCmd, FdNum, FileMode,
-        FutexOp, FutexOpWithFlags, GetRandomFlags, Iovec, LinkOptions, LinuxDirent64, MmapFlags,
-        MountFlags, OpenFlags, Pipe2Flags, Pointer, Pollfd, ProtFlags, RtSigprocmaskHow, Stat,
-        SyscallArg, Timespec, UnlinkOptions, WStatus, WaitOptions, Whence,
+        Advice, ArchPrctlCode, ClockId, CloneFlags, CopyFileRangeFlags, Domain, EpollCreate1Flags,
+        EpollCtlOp, EpollEvent, EventFdFlags, FcntlCmd, FdNum, FileMode, FutexOp, FutexOpWithFlags,
+        GetRandomFlags, Iovec, LinkOptions, LinuxDirent64, MmapFlags, MountFlags, OpenFlags,
+        Pipe2Flags, Pointer, Pollfd, ProtFlags, RtSigprocmaskHow, SocketPairType, Stat, SyscallArg,
+        Timespec, UnlinkOptions, WStatus, WaitOptions, Whence,
     },
     traits::{
         Syscall0, Syscall1, Syscall2, Syscall3, Syscall4, Syscall5, Syscall6, SyscallHandlers,
@@ -39,12 +43,16 @@ use self::{
 use super::{
     fd::{
         dir::DirectoryFileDescription,
+        epoll::Epoll,
+        eventfd::EventFd,
         file::{
             ReadWriteFileFileDescription, ReadonlyFileFileDescription, WriteonlyFileFileDescription,
         },
         pipe,
+        unix_socket::UnixSocket,
+        FileDescriptor,
     },
-    memory::VirtualMemoryActivator,
+    memory::{VirtualMemory, VirtualMemoryActivator},
     thread::{
         new_tid, Sigaction, Sigset, Stack, StackFlags, Thread, ThreadGuard, ThreadStatus,
         UserspaceRegisters, Waiter, CHILD_DEATHS, THREADS,
@@ -131,6 +139,7 @@ const SYSCALL_HANDLERS: SyscallHandlers = {
     handlers.register(SysDup2);
     handlers.register(SysGetpid);
     handlers.register(SysSendfile);
+    handlers.register(SysSocketpair);
     handlers.register(SysClone);
     handlers.register(SysFork);
     handlers.register(SysVfork);
@@ -153,9 +162,13 @@ const SYSCALL_HANDLERS: SyscallHandlers = {
     handlers.register(SysClockGettime);
     handlers.register(SysOpenat);
     handlers.register(SysExitGroup);
+    handlers.register(SysEpollWait);
+    handlers.register(SysEpollCtl);
     handlers.register(SysFutimesat);
     handlers.register(SysUnlinkat);
     handlers.register(SysLinkat);
+    handlers.register(SysEventfd);
+    handlers.register(SysEpollCreate1);
     handlers.register(SysPipe2);
     handlers.register(SysGetrandom);
     handlers.register(SysCopyFileRange);
@@ -176,19 +189,13 @@ fn read(
     let buf = buf.get();
     let count = usize::try_from(count)?;
 
-    let mut chunk = [0u8; 8192];
-    let max_chunk_len = chunk.len();
-    let len = cmp::min(max_chunk_len, count);
-    let chunk = &mut chunk[..len];
-
-    let len = fd.read(chunk)?;
-    let chunk = &chunk[..len];
-
-    vm_activator.activate(thread.virtual_memory(), |vm| vm.write(buf, chunk))?;
-
-    let len = u64::try_from(len)?;
-
-    Ok(len)
+    let virtual_memory = thread.virtual_memory().clone();
+    let op = ReadOp::new(fd, count, move |vm_activator, chunk| {
+        vm_activator.activate(&virtual_memory, |vm| vm.write(buf, chunk))?;
+        let len = u64::try_from(chunk.len())?;
+        Ok(len)
+    });
+    do_blocking(op, thread, vm_activator)
 }
 
 #[syscall(no = 1)]
@@ -238,15 +245,15 @@ fn open(
     let fd = if flags.contains(OpenFlags::WRONLY) {
         thread
             .fdtable()
-            .insert(WriteonlyFileFileDescription::new(file))
+            .insert(WriteonlyFileFileDescription::new(file))?
     } else if flags.contains(OpenFlags::RDWR) {
         thread
             .fdtable()
-            .insert(ReadWriteFileFileDescription::new(file))
+            .insert(ReadWriteFileFileDescription::new(file))?
     } else {
         thread
             .fdtable()
-            .insert(ReadonlyFileFileDescription::new(file))
+            .insert(ReadonlyFileFileDescription::new(file))?
     };
 
     Ok(fd.get() as u64)
@@ -689,7 +696,7 @@ fn madvise(addr: Pointer<c_void>, len: u64, advice: Advice) -> SyscallResult {
 fn dup(thread: &mut ThreadGuard, fildes: FdNum) -> SyscallResult {
     let fdtable = thread.fdtable();
     let fd = fdtable.get(fildes)?;
-    let newfd = fdtable.insert(fd);
+    let newfd = fdtable.insert(fd)?;
 
     Ok(newfd.get() as u64)
 }
@@ -715,6 +722,7 @@ fn getpid(thread: &mut ThreadGuard) -> SyscallResult {
 #[syscall(no = 40)]
 fn sendfile(
     thread: &mut ThreadGuard,
+    vm_activator: &mut VirtualMemoryActivator,
     out: FdNum,
     r#in: FdNum,
     offset: Pointer<u64>,
@@ -728,21 +736,66 @@ fn sendfile(
         todo!();
     }
 
-    let buffer = &mut [0; 8192];
-    let mut total_len = 0;
-    loop {
-        let len = r#in.read(buffer)?;
-        let buffer = &buffer[..len];
-        if buffer.is_empty() {
-            break;
-        }
-        total_len += buffer.len();
-
+    let count = usize::try_from(count)?;
+    let op = ReadOp::new(r#in.clone(), count, move |_, buffer| {
         out.write_all(buffer)?;
+
+        let mut total_len = buffer.len();
+        let mut buffer = [0; 8192];
+        while total_len < count {
+            let res = r#in.read(&mut buffer);
+            let Result::Ok(Blocking::Some(len)) = res else {
+                break;
+            };
+            out.write_all(&buffer[..len])?;
+            total_len += len;
+        }
+
+        let len = u64::try_from(total_len)?;
+        Ok(len)
+    });
+    do_blocking(op, thread, vm_activator)
+}
+
+#[syscall(no = 53)]
+fn socketpair(
+    thread: &mut ThreadGuard,
+    vm_activator: &mut VirtualMemoryActivator,
+    domain: Domain,
+    r#type: SocketPairType,
+    protocol: i32,
+    sv: Pointer<[FdNum; 2]>,
+) -> SyscallResult {
+    let res1;
+    let res2;
+
+    match domain {
+        Domain::Unix => {
+            if protocol != 0 {
+                return Err(Error::inval(()));
+            }
+
+            let (half1, half2) = UnixSocket::new_pair();
+            res1 = thread.fdtable().insert(half1);
+            res2 = thread.fdtable().insert(half2);
+        }
     }
 
-    let len = u64::try_from(total_len)?;
-    Ok(len)
+    // Make sure we don't leak a file descriptor if inserting the other one failed.
+    let (fd1, fd2) = match (res1, res2) {
+        (Result::Ok(fd1), Result::Ok(fd2)) => (fd1, fd2),
+        (Result::Ok(fd), Result::Err(err)) | (Result::Err(err), Result::Ok(fd)) => {
+            let _ = thread.fdtable().close(fd);
+            return Err(err);
+        }
+        (Result::Err(err), Result::Err(_)) => return Err(err),
+    };
+
+    vm_activator.activate(thread.virtual_memory(), |vm| {
+        vm.write(sv.get(), bytes_of(&[fd1.get(), fd2.get()]))
+    })?;
+
+    Ok(0)
 }
 
 #[syscall(no = 56)]
@@ -1046,8 +1099,15 @@ fn wait4(
 }
 
 #[syscall(no = 72)]
-fn fcntl(fd: FdNum, cmd: FcntlCmd, arg: u64) -> SyscallResult {
+fn fcntl(thread: &mut ThreadGuard, fd: FdNum, cmd: FcntlCmd, arg: u64) -> SyscallResult {
+    let fd = thread.fdtable().get(fd)?;
+
     match cmd {
+        FcntlCmd::DupFd => {
+            let min = i32::try_from(arg)?;
+            let fd_num = thread.fdtable().insert_after(min, fd)?;
+            Ok(fd_num.get().try_into()?)
+        }
         FcntlCmd::GetFd => {
             // FIXME: implement this
             Ok(0)
@@ -1235,11 +1295,13 @@ fn futex(
     vm_activator: &mut VirtualMemoryActivator,
     uaddr: Pointer<c_void>,
     op: FutexOpWithFlags,
-    val: u32,
+    val: u64,
     utime: u64,
     uaddr2: Pointer<c_void>,
     val3: u64,
 ) -> SyscallResult {
+    let val = val as u32;
+
     match op.op {
         FutexOp::Wait => {
             assert_eq!(utime, 0);
@@ -1382,6 +1444,75 @@ fn exit_group(
     exit(thread, vm_activator, u64::from(status))
 }
 
+#[syscall(no = 232)]
+fn epoll_wait(
+    thread: &mut ThreadGuard,
+    vm_activator: &mut VirtualMemoryActivator,
+    epfd: FdNum,
+    event: Pointer<EpollEvent>,
+    maxevents: i32,
+    timeout: i32,
+) -> SyscallResult {
+    let maxevents = usize::try_from(maxevents)?;
+
+    let fdtable = thread.fdtable();
+    let epoll = fdtable.get(epfd)?;
+    let events = epoll.epoll_wait(maxevents)?;
+    assert!(events.len() <= maxevents);
+
+    if events.is_empty() {
+        return Yield(ThreadStatus::BlockingIo);
+    }
+
+    vm_activator.activate(thread.virtual_memory(), |vm| -> Result<_> {
+        for (i, e) in events.iter().enumerate() {
+            let ptr = event.get() + i * size_of::<EpollEvent>();
+            vm.write(ptr, bytes_of(e))?;
+        }
+        Result::Ok(())
+    })?;
+
+    Ok(events.len().try_into()?)
+}
+
+#[syscall(no = 233)]
+fn epoll_ctl(
+    thread: &mut ThreadGuard,
+    vm_activator: &mut VirtualMemoryActivator,
+    epfd: FdNum,
+    op: EpollCtlOp,
+    fd: FdNum,
+    event: Pointer<EpollEvent>,
+) -> SyscallResult {
+    let event = if !event.is_null() {
+        vm_activator.activate(thread.virtual_memory(), |vm| -> Result<_> {
+            let mut bytes = [0; size_of::<EpollEvent>()];
+            vm.read(event.get(), &mut bytes)?;
+            let event = try_pod_read_unaligned::<EpollEvent>(&bytes)?;
+            Result::Ok(Some(event))
+        })?
+    } else {
+        None
+    };
+
+    debug!("epoll_ctl");
+
+    let epoll = thread.fdtable().get(epfd)?;
+    let fd = thread.fdtable().get(fd)?;
+
+    match op {
+        EpollCtlOp::Add => {
+            // Poll the fd once to check if it supports epoll.
+            let _ = fd.poll(EpollEvents::empty())?;
+
+            let event = event.ok_or_else(|| Error::inval(()))?;
+            epoll.epoll_add(fd, event)?
+        }
+    }
+
+    Ok(0)
+}
+
 #[syscall(no = 257)]
 fn openat(
     thread: &mut ThreadGuard,
@@ -1414,7 +1545,7 @@ fn openat(
         match node {
             Node::File(_) => Err(Error::not_dir(())),
             Node::Directory(dir) => {
-                let fd = fdtable.insert(DirectoryFileDescription::new(dir));
+                let fd = fdtable.insert(DirectoryFileDescription::new(dir))?;
                 Ok(fd.get() as u64)
             }
             Node::Link(_) => Err(Error::r#loop(())),
@@ -1508,6 +1639,18 @@ fn linkat(
     Ok(0)
 }
 
+#[syscall(no = 290)]
+fn eventfd(thread: &mut ThreadGuard, initval: u32, flags: EventFdFlags) -> SyscallResult {
+    let fd_num = thread.fdtable().insert(EventFd::new(initval))?;
+    Ok(fd_num.get().try_into().unwrap())
+}
+
+#[syscall(no = 291)]
+fn epoll_create1(thread: &mut ThreadGuard, flags: EpollCreate1Flags) -> SyscallResult {
+    let fd_num = thread.fdtable().insert(Epoll::new())?;
+    Ok(fd_num.get().try_into().unwrap())
+}
+
 #[syscall(no = 293)]
 fn pipe2(
     thread: &mut ThreadGuard,
@@ -1522,8 +1665,15 @@ fn pipe2(
     let (read_half, write_half) = pipe::new();
 
     let fdtable = thread.fdtable();
-    let read_half = fdtable.insert(read_half);
-    let write_half = fdtable.insert(write_half);
+    // Insert the first read half.
+    let read_half = fdtable.insert(read_half)?;
+    // Insert the second write half.
+    let res = fdtable.insert(write_half);
+    // Ensure that we close the first fd, if inserting the second failed.
+    if res.is_err() {
+        let _ = fdtable.close(read_half);
+    }
+    let write_half = res?;
 
     let mut bytes = [0; 8];
     bytes[0..4].copy_from_slice(&read_half.get().to_ne_bytes());
@@ -1561,39 +1711,147 @@ fn copy_file_range(
     len: u64,
     flags: CopyFileRangeFlags,
 ) -> SyscallResult {
-    let fdtable = thread.fdtable();
-    let fd_in = fdtable.get(fd_in)?;
-    let fd_out = fdtable.get(fd_out)?;
+    // let fdtable = thread.fdtable();
+    // let fd_in = fdtable.get(fd_in)?;
+    // let fd_out = fdtable.get(fd_out)?;
+    //
+    // if !off_in.is_null() || !off_out.is_null() {
+    // todo!()
+    // }
+    //
+    // let mut len = usize::try_from(len).unwrap_or(!0);
+    // let mut copied = 0;
+    //
+    // let mut buffer = [0; 128];
+    //
+    // while len > 0 {
+    // Setup buffer.
+    // let chunk_len = cmp::min(buffer.len(), len);
+    // let buffer = &mut buffer[..chunk_len];
+    //
+    // Read from fd_in.
+    // let num = fd_in.read(buffer)?;
+    // if num == 0 {
+    // break;
+    // }
+    //
+    // Write to fd_out.
+    // let buffer = &buffer[..num];
+    // fd_out.write_all(buffer)?;
+    //
+    // Update len and copied.
+    // len -= num;
+    // let num = u64::try_from(num)?;
+    // copied += num;
+    // }
+    //
+    // Ok(copied)
+    todo!()
+}
 
-    if !off_in.is_null() || !off_out.is_null() {
-        todo!()
+trait BlockingIoOperation: Send + 'static {
+    type EphemeralState;
+    type Output;
+
+    fn prepare(&mut self) -> Self::EphemeralState;
+    fn do_io(&mut self, state: &mut Self::EphemeralState) -> Result<Blocking<Self::Output>>;
+    fn complete(
+        self,
+        state: Self::EphemeralState,
+        output: Result<Self::Output>,
+        vm_activator: &mut VirtualMemoryActivator,
+    ) -> SyscallResult;
+}
+
+struct ReadOp<F> {
+    fd: FileDescriptor,
+    count: usize,
+    f: F,
+}
+
+impl<F> ReadOp<F>
+where
+    F: FnOnce(&mut VirtualMemoryActivator, &[u8]) -> SyscallResult + Send + 'static,
+{
+    pub fn new(fd: FileDescriptor, count: usize, f: F) -> Self {
+        Self { fd, count, f }
+    }
+}
+
+impl<F> BlockingIoOperation for ReadOp<F>
+where
+    F: FnOnce(&mut VirtualMemoryActivator, &[u8]) -> SyscallResult + Send + 'static,
+{
+    type EphemeralState = [u8; 8192];
+    type Output = usize;
+
+    fn prepare(&mut self) -> Self::EphemeralState {
+        [0; 8192]
     }
 
-    let mut len = usize::try_from(len).unwrap_or(!0);
-    let mut copied = 0;
+    fn do_io(&mut self, state: &mut Self::EphemeralState) -> Result<Blocking<Self::Output>> {
+        let len = cmp::min(state.len(), self.count);
+        let state = &mut state[..len];
+        self.fd.read(state)
+    }
 
-    let mut buffer = [0; 128];
+    fn complete(
+        mut self,
+        state: Self::EphemeralState,
+        output: Result<Self::Output>,
+        vm_activator: &mut VirtualMemoryActivator,
+    ) -> SyscallResult {
+        let len = output?;
+        (self.f)(vm_activator, &state[..len])
+    }
+}
 
-    while len > 0 {
-        // Setup buffer.
-        let chunk_len = cmp::min(buffer.len(), len);
-        let buffer = &mut buffer[..chunk_len];
+fn do_blocking(
+    mut op: impl BlockingIoOperation,
+    thread: &mut ThreadGuard,
+    vm_activator: &mut VirtualMemoryActivator,
+) -> SyscallResult {
+    let mut state = op.prepare();
+    let res = op.do_io(&mut state);
+    match res {
+        Result::Ok(Blocking::Some(val)) => op.complete(state, Result::Ok(val), vm_activator),
+        Result::Err(err) => op.complete(state, Result::Err(err), vm_activator),
+        Result::Ok(Blocking::Blocked(registration)) => {
+            let thread = thread.weak().upgrade().unwrap();
 
-        // Read from fd_in.
-        let num = fd_in.read(buffer)?;
-        if num == 0 {
-            break;
+            let mut op = Some(op);
+
+            registration.register(move |vm_activator| {
+                let op_ref = op.as_mut().unwrap();
+
+                let mut state = op_ref.prepare();
+                let res = op_ref.do_io(&mut state);
+
+                let res = match res {
+                    Result::Ok(Blocking::Some(val)) => {
+                        let op = op.take().unwrap();
+                        op.complete(state, Result::Ok(val), vm_activator)
+                    }
+                    Result::Err(err) => {
+                        let op = op.take().unwrap();
+                        op.complete(state, Result::Err(err), vm_activator)
+                    }
+                    Result::Ok(Blocking::Blocked(registration)) => {
+                        return Result::Err(RequiresRetry)
+                    }
+                };
+
+                match res {
+                    Ok(value) => thread.lock().complete(Result::Ok(value)),
+                    Err(err) => thread.lock().complete(Result::Err(err)),
+                    Yield(status) => {
+                        assert!(matches!(status, ThreadStatus::BlockingIo));
+                    }
+                }
+
+                Result::Ok(())
+            });
+            Yield(ThreadStatus::BlockingIo)
         }
-
-        // Write to fd_out.
-        let buffer = &buffer[..num];
-        fd_out.write_all(buffer)?;
-
-        // Update len and copied.
-        len -= num;
-        let num = u64::try_from(num)?;
-        copied += num;
     }
-
-    Ok(copied)
 }

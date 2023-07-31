@@ -876,4 +876,5 @@ pub enum ThreadStatus {
     WaitingForThread,
     FutexWait,
     FutexWaitBitset,
+    BlockingIo,
 }

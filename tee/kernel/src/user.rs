@@ -1,4 +1,5 @@
 use crate::{
+    async_io::run_pending_notifications,
     supervisor::halt,
     time::{advance_time, fire_expired_timeout},
 };
@@ -18,6 +19,11 @@ pub fn run(vm_activator: &mut VirtualMemoryActivator) -> ! {
 
         let done = CHILD_DEATHS.process(vm_activator);
         if !done {
+            should_halt = false;
+        }
+
+        let ran = run_pending_notifications(vm_activator);
+        if ran {
             should_halt = false;
         }
 

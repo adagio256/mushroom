@@ -3,6 +3,8 @@ use core::{
     ptr::{null_mut, NonNull},
 };
 
+use log::debug;
+
 use super::{fallback_allocator::FallbackAllocator, fixed_size_allocator::FixedSizeAllocator};
 
 type CombinedAllocator<A> = FallbackAllocator<
@@ -70,10 +72,13 @@ where
 {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let res = self.allocator.allocate(layout);
-        res.map_or(null_mut(), |ptr| ptr.as_ptr().cast())
+        let ptr = res.map_or(null_mut(), |ptr| ptr.as_ptr().cast());
+        // debug!(target:"alloc", "allocated {ptr:p} {layout:?}");
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // debug!(target:"alloc", "deallocating {ptr:p} {layout:?}");
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
         unsafe { self.allocator.deallocate(ptr, layout) }
     }

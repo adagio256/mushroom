@@ -13,8 +13,10 @@ use x86_64::{
         segmentation::{Segment, CS, DS, ES, GS, SS},
     },
     structures::{
-        gdt::{Descriptor, DescriptorFlags, GlobalDescriptorTable},
-        idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
+        gdt::{Descriptor, DescriptorFlags, GlobalDescriptorTable, SegmentSelector},
+        idt::{
+            InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode, SelectorErrorCode,
+        },
         paging::Page,
         tss::TaskStateSegment,
     },
@@ -50,7 +52,7 @@ pub fn switch_stack(f: extern "C" fn() -> !) -> ! {
 
 fn allocate_stack() -> VirtAddr {
     // FIXME: Guard pages.
-    let stack_layout = Layout::from_size_align(0x10000, 16).unwrap();
+    let stack_layout = Layout::from_size_align(0x100000, 16).unwrap();
     let stack = unsafe { alloc(stack_layout) };
     assert_ne!(stack, null_mut());
     let end_of_stack = unsafe { stack.add(stack_layout.size()) };
@@ -107,6 +109,8 @@ pub fn load_idt() {
     static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         let mut idt = InterruptDescriptorTable::new();
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.segment_not_present
+            .set_handler_fn(segment_not_present_handler);
         idt.double_fault.set_handler_fn(double_fault_handler);
         idt
     });
@@ -141,12 +145,12 @@ extern "x86-interrupt" fn page_fault_handler(
     } else {
         if let Ok(cr2) = VirtAddr::try_new(cr2) {
             if let Some(entry) = entry_for_page(Page::containing_address(cr2)) {
-                error!("page is mapped to {entry:?}");
+                error!(target:"b","page is mapped to {entry:?}");
             } else {
-                error!("page is not mapped");
+                error!(target:"b","page is not mapped");
             }
         } else {
-            error!("cr2 is not a canonical address");
+            error!(target:"b","cr2 is not a canonical address");
         }
 
         panic!(
@@ -156,8 +160,21 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 }
 
+extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame, code: u64) {
+    let _guard = SwapGsGuard::new(&frame);
+
+    let code = SelectorErrorCode::new(code).unwrap();
+    panic!("segment not present {frame:x?} {code:x?}");
+}
+
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, code: u64) -> ! {
     let _guard = SwapGsGuard::new(&frame);
+
+    debug!("double fault {frame:x?} {code:x?}");
+
+    // let instructions = frame.instruction_pointer;
+    // let instr_bytes = unsafe { core::ptr::read(instructions.as_ptr::<[u8; 8]>()) };
+    // debug!("instruction bytes: {instr_bytes:02x?}");
 
     panic!("double fault {frame:x?} {code:x?}");
 }

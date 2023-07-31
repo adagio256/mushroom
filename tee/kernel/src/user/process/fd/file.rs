@@ -3,6 +3,7 @@ use spin::Mutex;
 use x86_64::VirtAddr;
 
 use crate::{
+    async_io::Blocking,
     error::{Error, Result},
     fs::node::File,
     user::process::{
@@ -29,11 +30,11 @@ impl ReadonlyFileFileDescription {
 }
 
 impl OpenFileDescription for ReadonlyFileFileDescription {
-    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&self, buf: &mut [u8]) -> Result<Blocking<usize>> {
         let mut guard = self.cursor_idx.lock();
         let len = self.file.read(*guard, buf)?;
         *guard += len;
-        Ok(len)
+        Ok(Blocking::Some(len))
     }
 
     fn pread(&self, pos: usize, buf: &mut [u8]) -> Result<usize> {
@@ -147,11 +148,11 @@ impl ReadWriteFileFileDescription {
 }
 
 impl OpenFileDescription for ReadWriteFileFileDescription {
-    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&self, buf: &mut [u8]) -> Result<Blocking<usize>> {
         let mut guard = self.cursor_idx.lock();
         let len = self.file.read(*guard, buf)?;
         *guard += len;
-        Ok(len)
+        Ok(Blocking::Some(len))
     }
 
     fn write(&self, buf: &[u8]) -> Result<usize> {

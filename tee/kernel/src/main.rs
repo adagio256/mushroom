@@ -17,6 +17,7 @@
     pointer_byte_offsets,
     step_trait,
     trait_upcasting,
+    try_blocks,
     try_trait_v2
 )]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -29,6 +30,7 @@ use supervisor::launch_next_ap;
 
 use crate::{per_cpu::PerCpu, user::process::memory::VirtualMemoryActivator};
 
+mod async_io;
 mod error;
 mod exception;
 mod fs;

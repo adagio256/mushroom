@@ -279,6 +279,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flate2",
+ "linux-futex",
  "nix",
  "tar",
 ]
@@ -331,6 +332,15 @@ name = "libc"
 version = "0.2.146"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f92be4933c13fd498862a9e02a3055f8a8d9c039ce33db97306fd5a6caa7f29b"
+
+[[package]]
+name = "linux-futex"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "222e5374b2d82313ab4d592bf28d075bd31db6593eab2f714bf13d23c4f0bc9d"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "lock_api"
