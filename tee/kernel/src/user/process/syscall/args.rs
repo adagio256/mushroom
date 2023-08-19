@@ -19,12 +19,15 @@ use crate::{
     },
 };
 
+use super::cpu_state::Abi;
+
 pub trait SyscallArg: Display + Send + Copy {
-    fn parse(value: u64) -> Result<Self>;
+    fn parse(value: u64, abi: Abi) -> Result<Self>;
 
     fn display(
         f: &mut dyn fmt::Write,
         value: u64,
+        abi: Abi,
         thread: &ThreadGuard<'_>,
         vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result;
@@ -70,13 +73,14 @@ macro_rules! bitflags {
         }
 
         impl SyscallArg for $strukt {
-            fn parse(value: u64) -> Result<Self> {
+            fn parse(value: u64, _: Abi) -> Result<Self> {
                 Self::from_bits(value).ok_or(Error::inval(()))
             }
 
             fn display(
                 f: &mut dyn fmt::Write,
                 value: u64,
+                _: Abi,
                 _thread: &ThreadGuard<'_>,
                 _vm_activator: &mut VirtualMemoryActivator,
             ) -> fmt::Result {
@@ -114,7 +118,7 @@ macro_rules! enum_arg {
 
 
         impl SyscallArg for $enuhm {
-            fn parse(value: u64) -> Result<Self> {
+            fn parse(value: u64, _: Abi) -> Result<Self> {
                 match value {
                     $(
                         value if value == Self::$variant as u64 => Ok(Self::$variant),
@@ -126,10 +130,11 @@ macro_rules! enum_arg {
             fn display(
                 f: &mut dyn fmt::Write,
                 value: u64,
+                abi: Abi,
                 _thread: &ThreadGuard<'_>,
                 _vm_activator: &mut VirtualMemoryActivator,
             ) -> fmt::Result {
-                match Self::parse(value) {
+                match Self::parse(value, abi) {
                     Ok(value) => write!(f, "{value}"),
                     Err(_) => write!(f, "{value}"),
                 }
@@ -148,13 +153,14 @@ impl Display for Ignored {
 }
 
 impl SyscallArg for Ignored {
-    fn parse(_value: u64) -> Result<Self> {
+    fn parse(_value: u64, _: Abi) -> Result<Self> {
         Ok(Self(()))
     }
 
     fn display(
         f: &mut dyn fmt::Write,
         _value: u64,
+        _: Abi,
         _thread: &ThreadGuard<'_>,
         _vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result {
@@ -207,7 +213,7 @@ impl<T> SyscallArg for Pointer<T>
 where
     T: Pointee + Send + ?Sized,
 {
-    fn parse(value: u64) -> Result<Self> {
+    fn parse(value: u64, _: Abi) -> Result<Self> {
         Ok(Self {
             value,
             _marker: PhantomData,
@@ -217,6 +223,7 @@ where
     fn display(
         f: &mut dyn fmt::Write,
         value: u64,
+        _: Abi,
         thread: &ThreadGuard<'_>,
         vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result {
@@ -258,7 +265,7 @@ impl Pointee for [u8] {}
 impl Pointee for c_void {}
 impl Pointee for EpollEvent {}
 impl Pointee for FdNum {}
-impl Pointee for Iovec {}
+impl Pointee for Iovec64 {}
 impl Pointee for LinuxDirent64 {}
 impl Pointee for Sigaction {}
 impl Pointee for Sigset {}
@@ -271,13 +278,14 @@ impl Pointee for UserDesc {}
 impl Pointee for WStatus {}
 
 impl SyscallArg for u64 {
-    fn parse(value: u64) -> Result<Self> {
+    fn parse(value: u64, _: Abi) -> Result<Self> {
         Ok(value)
     }
 
     fn display(
         f: &mut dyn fmt::Write,
         value: u64,
+        _: Abi,
         _thread: &ThreadGuard<'_>,
         _vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result {
@@ -286,32 +294,38 @@ impl SyscallArg for u64 {
 }
 
 impl SyscallArg for i64 {
-    fn parse(value: u64) -> Result<Self> {
-        Ok(value as i64)
+    fn parse(value: u64, abi: Abi) -> Result<Self> {
+        match abi {
+            Abi::I386 => Ok(value as u32 as i32 as i64),
+            Abi::Amd64 => Ok(value as i64),
+        }
     }
 
     fn display(
         f: &mut dyn fmt::Write,
         value: u64,
+        abi: Abi,
         _thread: &ThreadGuard<'_>,
         _vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result {
-        write!(f, "{}", value as i64)
+        write!(f, "{}", Self::parse(value, abi).unwrap())
     }
 }
 
 impl SyscallArg for i32 {
-    fn parse(value: u64) -> Result<Self> {
-        (value as i64).try_into().map_err(Into::into)
+    fn parse(value: u64, abi: Abi) -> Result<Self> {
+        let value = i64::parse(value, abi)?;
+        value.try_into().map_err(Into::into)
     }
 
     fn display(
         f: &mut dyn fmt::Write,
         value: u64,
-        _thread: &ThreadGuard<'_>,
-        _vm_activator: &mut VirtualMemoryActivator,
+        abi: Abi,
+        thread: &ThreadGuard<'_>,
+        vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result {
-        write!(f, "{}", value as i64)
+        i64::display(f, value, abi, thread, vm_activator)
     }
 }
 
@@ -406,20 +420,20 @@ impl Display for FdNum {
 }
 
 impl SyscallArg for FdNum {
-    fn parse(value: u64) -> Result<Self> {
-        match i32::try_from(value as i64) {
-            Ok(fd) => Ok(Self(fd)),
-            _ => Err(Error::bad_f(())),
-        }
+    fn parse(value: u64, abi: Abi) -> Result<Self> {
+        i32::parse(value, abi)
+            .map(Self)
+            .map_err(|_| Error::bad_f(()))
     }
 
     fn display(
         f: &mut dyn fmt::Write,
         value: u64,
+        abi: Abi,
         _thread: &ThreadGuard<'_>,
         _vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result {
-        match Self::parse(value) {
+        match Self::parse(value, abi) {
             Ok(fd) => write!(f, "{fd}"),
             Err(_) => {
                 write!(f, "{value} (invalid fd)")
@@ -520,21 +534,22 @@ impl Display for FutexOpWithFlags {
 }
 
 impl SyscallArg for FutexOpWithFlags {
-    fn parse(value: u64) -> Result<Self> {
-        let op = FutexOp::parse(value & 0x7f)?;
-        let flags = FutexFlags::parse(value & !0x7f)?;
+    fn parse(value: u64, abi: Abi) -> Result<Self> {
+        let op = FutexOp::parse(value & 0x7f, abi)?;
+        let flags = FutexFlags::parse(value & !0x7f, abi)?;
         Ok(Self { op, flags })
     }
 
     fn display(
         f: &mut dyn fmt::Write,
         value: u64,
+        abi: Abi,
         thread: &ThreadGuard<'_>,
         vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result {
-        FutexOp::display(f, value & 0x7f, thread, vm_activator)?;
+        FutexOp::display(f, value & 0x7f, abi, thread, vm_activator)?;
         write!(f, " | ")?;
-        FutexFlags::display(f, value & !0x7f, thread, vm_activator)
+        FutexFlags::display(f, value & !0x7f, abi, thread, vm_activator)
     }
 }
 
@@ -580,6 +595,64 @@ pub struct Stat {
     pub _unused: [i64; 3],
 }
 
+#[derive(Debug, Clone, Copy, Zeroable, NoUninit)]
+#[repr(C, packed)]
+pub struct Stat64 {
+    pub dev: u64,
+    pub __pad0: [u8; 4],
+
+    pub __ino: u32,
+
+    pub mode: FileTypeAndMode,
+    pub nlink: u32,
+
+    pub uid: u32,
+    pub gid: u32,
+
+    pub rdev: u64,
+    pub __pad3: [u8; 4],
+
+    pub size: i64,
+    pub blksize: u32,
+
+    pub blocks: i64,
+
+    pub atime: u32,
+    pub atime_nsec: u32,
+    pub mtime: u32,
+    pub mtime_nsec: u32,
+    pub ctime: u32,
+    pub ctime_nsec: u32,
+
+    pub ino: u64,
+}
+
+impl From<Stat> for Stat64 {
+    fn from(value: Stat) -> Self {
+        Self {
+            dev: value.dev,
+            __pad0: [0; 4],
+            __ino: value.ino as u32,
+            mode: value.mode,
+            nlink: value.nlink as u32,
+            uid: value.uid,
+            gid: value.gid,
+            rdev: value.rdev,
+            __pad3: [0; 4],
+            size: value.size,
+            blksize: value.blksize as u32,
+            blocks: value.blocks,
+            atime: value.atime as u32,
+            atime_nsec: value.atime_nsec as u32,
+            mtime: value.mtime as u32,
+            mtime_nsec: value.mtime_nsec as u32,
+            ctime: value.ctime as u32,
+            ctime_nsec: value.ctime_nsec as u32,
+            ino: value.ino,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Zeroable, NoUninit)]
 #[repr(transparent)]
 pub struct FileTypeAndMode(u32);
@@ -622,9 +695,25 @@ pub enum FileType {
 
 #[derive(Debug, Clone, Copy, Zeroable, Pod)]
 #[repr(C)]
-pub struct Iovec {
+pub struct Iovec32 {
+    pub base: u32,
+    pub len: u32,
+}
+
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
+#[repr(C)]
+pub struct Iovec64 {
     pub base: u64,
     pub len: u64,
+}
+
+impl From<Iovec32> for Iovec64 {
+    fn from(value: Iovec32) -> Self {
+        Self {
+            base: u64::from(value.base),
+            len: u64::from(value.len),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Zeroable, Pod)]

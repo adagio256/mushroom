@@ -29,13 +29,14 @@ pub struct SyscallArgs {
 pub type SyscallResult = Result<u64>;
 
 impl SyscallArg for u32 {
-    fn parse(value: u64) -> Result<Self> {
+    fn parse(value: u64, _abi: Abi) -> Result<Self> {
         Ok(u32::try_from(value)?)
     }
 
     fn display(
         f: &mut dyn fmt::Write,
         value: u64,
+        _abi: Abi,
         _thread: &ThreadGuard<'_>,
         _vm_activator: &mut VirtualMemoryActivator,
     ) -> fmt::Result {
@@ -138,7 +139,7 @@ impl SyscallHandlers {
         })?;
 
         // Whether the syscall should occur in the debug logs.
-        let enable_log = !matches!(syscall_no, 0 | 1 | 202 | 228) && thread.tid() != 1;
+        let enable_log = !matches!(syscall_no, 0 | 1 | 3 | 4 | 202 | 228) && thread.tid() != 1;
 
         let res = (handler.execute)(thread.clone(), args).await;
 
