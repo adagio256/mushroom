@@ -238,7 +238,7 @@ pub unsafe fn find_dirty_userspace_pages(mut f: impl FnMut(Page) -> Result<()>) 
         for p4_index in (0..256).map(PageTableIndex::new) {
             let pml4e = &pml4[p4_index];
             if !pml4e.is_dirty() {
-                continue;
+                // continue;
             }
             let Some(pdp) = pml4e.acquire_existing() else {
                 continue;
@@ -247,7 +247,7 @@ pub unsafe fn find_dirty_userspace_pages(mut f: impl FnMut(Page) -> Result<()>) 
             for p3_index in (0..512).map(PageTableIndex::new) {
                 let pdpe = &pdp[p3_index];
                 if !pdpe.is_dirty() {
-                    continue;
+                    // continue;
                 }
                 let Some(pd) = pdpe.acquire_existing() else {
                     continue;
@@ -256,7 +256,7 @@ pub unsafe fn find_dirty_userspace_pages(mut f: impl FnMut(Page) -> Result<()>) 
                 for p2_index in (0..512).map(PageTableIndex::new) {
                     let pde = &pd[p2_index];
                     if !pde.is_dirty() {
-                        continue;
+                        // continue;
                     }
                     let Some(pt) = pde.acquire_existing() else {
                         continue;
@@ -383,6 +383,13 @@ struct ActivePageTable<L> {
 
 impl ActivePageTable<Level4> {
     fn get() -> &'static Self {
+        static INVLPGB: Lazy<Invlpgb> =
+            Lazy::new(|| Invlpgb::new().expect("invlpgb not supported"));
+
+        INVLPGB.build().include_global().flush();
+
+        INVLPGB.tlbsync();
+
         let ptr = Page::from_page_table_indices(
             RECURSIVE_INDEX,
             RECURSIVE_INDEX,
@@ -544,6 +551,8 @@ where
                 // We're done.
                 return Some(false);
             } else {
+                assert_eq!(current_entry, 0);
+
                 // Start initializing the entry.
 
                 // Check if another core is already initializing the entry.
@@ -719,6 +728,8 @@ impl<L> ActivePageTableEntry<L> {
         };
         flush.flush();
 
+        INVLPGB.build().include_global().flush();
+
         INVLPGB.tlbsync();
     }
 
@@ -784,7 +795,8 @@ impl ActivePageTableEntry<Level1> {
         self.flush(old_entry.global());
 
         // FIXME: Free up the frame.
-        let _maybe_frame = unsafe { self.parent_table_entry().release_reference_count() };
+        let maybe_frame = unsafe { self.parent_table_entry().release_reference_count() };
+        assert_eq!(maybe_frame, None);
 
         old_entry
     }
@@ -812,7 +824,7 @@ impl ActivePageTableEntry<Level1> {
         atomic_fetch_or(&self.entry, add_mask);
         atomic_fetch_and(&self.entry, !remove_mask);
 
-        self.flush(global);
+        self.flush(true);
     }
 
     pub unsafe fn remove_flags(&self, flags: PageTableFlags) {
@@ -838,7 +850,7 @@ impl ActivePageTableEntry<Level1> {
         atomic_fetch_or(&self.entry, add_mask);
         atomic_fetch_and(&self.entry, !remove_mask);
 
-        self.flush(global);
+        self.flush(true);
     }
 
     pub fn entry(&self) -> Option<PresentPageTableEntry> {

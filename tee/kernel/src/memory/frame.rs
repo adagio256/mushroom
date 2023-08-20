@@ -89,6 +89,10 @@ impl BitmapFrameAllocatorState {
         core::mem::swap(&mut self.dynamic, dynamic);
         self.dynamic.append(dynamic);
     }
+
+    fn len(&self) -> usize {
+        self.r#static.len() + self.dynamic.len()
+    }
 }
 
 impl Index<usize> for BitmapFrameAllocatorState {
@@ -171,6 +175,10 @@ impl FrameDeallocator<Size4KiB> for &BitmapFrameAllocator {
         let mut state = self.state.lock();
         let mut i = 0;
         loop {
+            if i >= state.len() {
+                debug!("{frame:?}");
+            }
+
             let bitmap = &mut state[i];
             if !bitmap.contains(frame) {
                 i += 1;
@@ -235,6 +243,7 @@ impl Bitmap {
 
         let offset = frame - base_frame;
         let offset = usize::try_from(offset).unwrap();
+        assert!(self.bitmap.get_bit(offset));
         self.bitmap.set_bit(offset, false);
 
         self.used -= 1;

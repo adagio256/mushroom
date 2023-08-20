@@ -25,7 +25,7 @@ lto = "thin"
 debug-assertions = true
 overflow-checks = true
 # https://github.com/rust-lang/rust/issues/108853
-rustflags = ["-Zshare-generics=off"]
+# rustflags = ["-Zshare-generics=off"]
 
 [profile.supervisor-release]
 inherits = "release"
@@ -34,7 +34,7 @@ lto = "thin"
 debug-assertions = true
 overflow-checks = true
 # https://github.com/rust-lang/rust/issues/108853
-rustflags = ["-Zshare-generics=off"]
+# rustflags = ["-Zshare-generics=off"]
 
 [patch.crates-io]
 bytemuck = { git = "https://github.com/Freax13/bytemuck.git", rev = "e63ffe8d10129a70a28fcad2bf656782bec8d4bb" }

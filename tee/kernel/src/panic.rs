@@ -18,6 +18,7 @@ fn panic_handler(info: &PanicInfo) -> ! {
 
         if is_already_panicking {
             // We messed up bad. Cause a triple fault.
+            exit(false);
             triple_fault();
         }
 
