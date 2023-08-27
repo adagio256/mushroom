@@ -1,5 +1,5 @@
 use core::{
-    any::Any,
+    any::{type_name, Any},
     ops::Deref,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -9,11 +9,15 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::debug;
 use spin::Lazy;
 
 use crate::{
     error::{Error, Result},
-    user::process::syscall::args::{FileMode, FileType, Stat},
+    user::process::{
+        memory::ActiveVirtualMemory,
+        syscall::args::{FileMode, FileType, FileTypeAndMode, Pointer, Stat, Timespec},
+    },
 };
 
 use self::tmpfs::TmpFsDir;
@@ -112,6 +116,19 @@ impl TryFrom<NonLinkNode> for Arc<dyn Directory> {
     }
 }
 
+impl TryFrom<Node> for Arc<dyn Directory> {
+    type Error = Error;
+
+    #[track_caller]
+    fn try_from(value: Node) -> Result<Self> {
+        match value {
+            Node::File(_) => Err(Error::not_dir(())),
+            Node::Directory(dir) => Ok(dir),
+            Node::Link(_) => Err(Error::not_dir(())),
+        }
+    }
+}
+
 impl From<NonLinkNode> for Node {
     fn from(value: NonLinkNode) -> Self {
         match value {
@@ -125,8 +142,72 @@ pub trait File: Send + Sync + 'static {
     fn stat(&self) -> Stat;
     fn set_mode(&self, mode: FileMode);
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize>;
+    fn read_to_user(
+        &self,
+        offset: usize,
+        vm: &mut ActiveVirtualMemory,
+        pointer: Pointer<[u8]>,
+        mut len: usize,
+    ) -> Result<usize> {
+        const MAX_BUFFER_LEN: usize = 8192;
+        if len > MAX_BUFFER_LEN {
+            len = MAX_BUFFER_LEN;
+            debug!("unoptimized read from {} truncated", type_name::<Self>());
+        }
+
+        let mut buf = [0; MAX_BUFFER_LEN];
+        let buf = &mut buf[..len];
+
+        let count = self.read(offset, buf)?;
+
+        let buf = &buf[..count];
+        vm.write_bytes(pointer.get(), buf)?;
+
+        Ok(count)
+    }
     fn write(&self, offset: usize, buf: &[u8]) -> Result<usize>;
+    fn write_from_user(
+        &self,
+        offset: usize,
+        vm: &mut ActiveVirtualMemory,
+        pointer: Pointer<[u8]>,
+        mut len: usize,
+    ) -> Result<usize> {
+        const MAX_BUFFER_LEN: usize = 8192;
+        if len > MAX_BUFFER_LEN {
+            len = MAX_BUFFER_LEN;
+            debug!("unoptimized write to {} truncated", type_name::<Self>());
+        }
+
+        let mut buf = [0; MAX_BUFFER_LEN];
+        let buf = &mut buf[..len];
+
+        vm.read_bytes(pointer.get(), buf)?;
+
+        self.write(offset, buf)
+    }
+    fn append(&self, buf: &[u8]) -> Result<usize>;
+    fn append_from_user(
+        &self,
+        vm: &mut ActiveVirtualMemory,
+        pointer: Pointer<[u8]>,
+        mut len: usize,
+    ) -> Result<usize> {
+        const MAX_BUFFER_LEN: usize = 8192;
+        if len > MAX_BUFFER_LEN {
+            len = MAX_BUFFER_LEN;
+            debug!("unoptimized write to {} truncated", type_name::<Self>());
+        }
+
+        let mut buf = [0; MAX_BUFFER_LEN];
+        let buf = &mut buf[..len];
+
+        vm.read_bytes(pointer.get(), buf)?;
+
+        self.append(buf)
+    }
     fn read_snapshot(&self) -> Result<FileSnapshot>;
+    fn truncate(&self) -> Result<()>;
 
     fn mode(&self) -> FileMode {
         self.stat().mode.mode()
@@ -231,12 +312,36 @@ impl From<FileName<'static>> for DirEntryName {
 
 #[derive(Clone)]
 pub struct Link {
+    ino: u64,
     target: Path,
 }
 
 impl Link {
     fn stat(&self) -> Stat {
-        todo!()
+        Stat {
+            dev: 0,
+            ino: self.ino,
+            nlink: 1,
+            mode: FileTypeAndMode::new(FileType::Link, FileMode::ALL),
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 0,
+            blocks: 0,
+            atime: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            mtime: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            ctime: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        }
     }
 }
 
@@ -428,4 +533,33 @@ pub fn hard_link(
         PathSegment::DotDot => todo!(),
         PathSegment::FileName(filename) => parent.hard_link(filename.into_owned(), target_node),
     }
+}
+
+pub fn rename(
+    oldd: Arc<dyn Directory>,
+    oldname: &Path,
+    newd: Arc<dyn Directory>,
+    newname: &Path,
+) -> Result<()> {
+    let (old_parent, segment) = find_parent(oldd, oldname)?;
+    let oldname = match segment {
+        PathSegment::Root | PathSegment::Empty | PathSegment::Dot | PathSegment::DotDot => {
+            return Err(Error::is_dir(()))
+        }
+        PathSegment::FileName(filename) => filename,
+    };
+
+    let (new_parent, segment) = find_parent(newd, newname)?;
+    let newname = match segment {
+        PathSegment::Root | PathSegment::Empty | PathSegment::Dot | PathSegment::DotDot => {
+            return Err(Error::is_dir(()))
+        }
+        PathSegment::FileName(filename) => filename,
+    };
+
+    let node = old_parent.get_node(&oldname)?;
+    new_parent.mount(newname.into_owned(), node)?;
+    old_parent.delete_non_dir(oldname.into_owned())?;
+
+    Ok(())
 }

@@ -150,12 +150,13 @@ impl ActiveVirtualMemory<'_, '_> {
         };
 
         let mut str_addr = stack + 0x800u64;
-        let mut write_str = |value: &CStr| {
+        let mut write_bytes = |value: &[u8]| {
             let addr = str_addr;
-            self.write_bytes(str_addr, value.to_bytes_with_nul())?;
-            str_addr += value.to_bytes_with_nul().len();
+            self.write_bytes(str_addr, value)?;
+            str_addr += value.len();
             Result::<_>::Ok(addr)
         };
+        let mut write_str = |value: &CStr| write_bytes(value.to_bytes_with_nul());
 
         write(u64::try_from(argv.len()).unwrap()); // argc
         for arg in argv {
@@ -186,6 +187,8 @@ impl ActiveVirtualMemory<'_, '_> {
         }
         write(9); // AT_ENTRY
         write(info.entry);
+        write(25); // AT_RANDOM
+        write(write_bytes(&[0xcc; 16])?.as_u64());
         write(0); // AT_NULL
 
         let cpu_state = match vm_size {

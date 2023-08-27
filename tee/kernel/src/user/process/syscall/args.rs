@@ -308,8 +308,13 @@ impl SyscallArg for i64 {
 
 impl SyscallArg for i32 {
     fn parse(value: u64, abi: Abi) -> Result<Self> {
-        let value = i64::parse(value, abi)?;
-        value.try_into().map_err(Into::into)
+        i64::parse(value, abi)
+            .and_then(|value| value.try_into().map_err(Into::into))
+            .or_else(|_| {
+                u32::try_from(value)
+                    .map(|value| value as i32)
+                    .map_err(Into::into)
+            })
     }
 
     fn display(
@@ -331,6 +336,8 @@ bitflags! {
         const EXCL = 1 << 7;
         const NOCTTY = 1 << 8;
         const TRUNC = 1 << 9;
+        const APPEND = 1 << 10;
+        const DSYNC = 1 << 12;
         const LARGEFILE = 1 << 15;
         const DIRECTORY = 1 << 16;
         const NOFOLLOW = 1 << 17;
@@ -380,7 +387,9 @@ bitflags! {
         const SHARED_VALIDATE = 1 << 0 | 1 << 1;
         const FIXED = 1 << 4;
         const ANONYMOUS = 1 << 5;
+        const LOCKED = 1 << 13;
         const STACK = 1 << 17;
+        const ALL = !0;
     }
 }
 

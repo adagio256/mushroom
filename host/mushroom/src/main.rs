@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use libc::{MAP_PRIVATE, O_RDONLY, O_SYNC, PROT_READ};
 use mushroom_verify::{Configuration, InputHash, OutputHash, VcekParameters};
 use snp_types::guest_policy::GuestPolicy;
 use vcek_kds::{Product, Vcek};

@@ -141,9 +141,14 @@ impl SyscallHandlers {
         // Whether the syscall should occur in the debug logs.
         let enable_log = !matches!(syscall_no, 0 | 1 | 3 | 4 | 202 | 228) && thread.tid() != 1;
         // let enable_log = thread.tid() == 5;
-        let enable_log = false;
+        let enable_log = match args.abi {
+            Abi::I386 => !matches!(syscall_no, 3 | 4) && false,
+            // Abi::Amd64 => !matches!(syscall_no, 0 | 1 | 202 | 228) || thread.tid() == 13,
+            Abi::Amd64 => !matches!(syscall_no, 202 | 228) || thread.tid() == 13,
+        };
+        // let enable_log = true;
 
-        if enable_log {
+        if enable_log && false {
             let thread = thread.clone();
             VirtualMemoryActivator::r#do(move |vm_activator| {
                 let guard = thread.lock();
@@ -165,6 +170,8 @@ impl SyscallHandlers {
         }
 
         let res = (handler.execute)(thread.clone(), args).await;
+
+        let enable_log = enable_log || res.is_err();
 
         if enable_log {
             VirtualMemoryActivator::r#do(move |vm_activator| {

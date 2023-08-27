@@ -7,7 +7,7 @@ use crate::{
     fs::node::File,
     user::process::{
         memory::{ActiveVirtualMemory, MemoryPermissions},
-        syscall::args::{FileMode, Stat, Whence},
+        syscall::args::{FileMode, Pointer, Stat, Whence},
     },
 };
 
@@ -32,6 +32,18 @@ impl OpenFileDescription for ReadonlyFileFileDescription {
     fn read(&self, buf: &mut [u8]) -> Result<usize> {
         let mut guard = self.cursor_idx.lock();
         let len = self.file.read(*guard, buf)?;
+        *guard += len;
+        Ok(len)
+    }
+
+    fn read_to_user(
+        &self,
+        vm: &mut ActiveVirtualMemory,
+        pointer: Pointer<[u8]>,
+        len: usize,
+    ) -> Result<usize> {
+        let mut guard = self.cursor_idx.lock();
+        let len = self.file.read_to_user(*guard, vm, pointer, len)?;
         *guard += len;
         Ok(len)
     }
@@ -101,6 +113,18 @@ impl OpenFileDescription for WriteonlyFileFileDescription {
         Ok(len)
     }
 
+    fn write_from_user(
+        &self,
+        vm: &mut ActiveVirtualMemory,
+        pointer: Pointer<[u8]>,
+        len: usize,
+    ) -> Result<usize> {
+        let mut guard = self.cursor_idx.lock();
+        let len = self.file.write_from_user(*guard, vm, pointer, len)?;
+        *guard += len;
+        Ok(len)
+    }
+
     fn pwrite(&self, pos: usize, buf: &[u8]) -> Result<usize> {
         self.file.write(pos, buf)
     }
@@ -119,6 +143,41 @@ impl OpenFileDescription for WriteonlyFileFileDescription {
             Whence::Hole => todo!(),
         }
         Ok(*guard)
+    }
+
+    fn set_mode(&self, mode: FileMode) -> Result<()> {
+        self.file.set_mode(mode);
+        Ok(())
+    }
+
+    fn stat(&self) -> Result<Stat> {
+        Ok(self.file.stat())
+    }
+}
+
+/// A file description for files opened as write-only.
+pub struct AppendFileFileDescription {
+    file: Arc<dyn File>,
+}
+
+impl AppendFileFileDescription {
+    pub fn new(file: Arc<dyn File>) -> Self {
+        Self { file }
+    }
+}
+
+impl OpenFileDescription for AppendFileFileDescription {
+    fn write(&self, buf: &[u8]) -> Result<usize> {
+        self.file.append(buf)
+    }
+
+    fn write_from_user(
+        &self,
+        vm: &mut ActiveVirtualMemory,
+        pointer: Pointer<[u8]>,
+        len: usize,
+    ) -> Result<usize> {
+        self.file.append_from_user(vm, pointer, len)
     }
 
     fn set_mode(&self, mode: FileMode) -> Result<()> {

@@ -8,6 +8,7 @@ use constants::{
     FINISH_OUTPUT_MSR, HALT_PORT, KICK_AP_PORT, MAX_APS_COUNT, MEMORY_MSR, SCHEDULE_PORT,
     UPDATE_OUTPUT_MSR,
 };
+use log::debug;
 use spin::Mutex;
 use x86_64::{
     instructions::port::PortWriteOnly,
@@ -100,6 +101,7 @@ pub fn halt() -> Result<(), LastRunningVcpuError> {
     let mut running_vcpus = RUNNING_VCPUS.load(Ordering::SeqCst);
     loop {
         debug_assert_ne!(running_vcpus, 0);
+        // debug!("{running_vcpus}");
         if running_vcpus == 1 {
             return Err(LastRunningVcpuError);
         }

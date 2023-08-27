@@ -71,7 +71,11 @@ pub fn start_init_process(vm_activator: &mut VirtualMemoryActivator) {
 
         guard.start_executable(
             bytes,
-            &[CStr::from_bytes_with_nul(b"/bin/init\0").unwrap()],
+            &[
+                // CStr::from_bytes_with_nul(b"uname\0").unwrap(),
+                // CStr::from_bytes_with_nul(b"-a\0").unwrap(),
+                CStr::from_bytes_with_nul(b"/bin/init\0").unwrap(),
+            ],
             &[] as &[&CStr],
             vm_activator,
         )?;

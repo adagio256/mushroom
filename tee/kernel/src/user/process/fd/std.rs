@@ -11,6 +11,7 @@ pub struct Stdout;
 
 impl OpenFileDescription for Stdout {
     fn write(&self, buf: &[u8]) -> Result<usize> {
+        debug!("{buf:02x?}");
         let chunk = core::str::from_utf8(buf);
         debug!("{chunk:02x?}");
         Ok(buf.len())
