@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    new_ino,
+    fdfs, new_ino,
     tmpfs::{TmpFsDir, TmpFsFile},
     Directory, File, FileSnapshot, Node,
 };
@@ -41,6 +41,13 @@ pub fn new(parent: Weak<dyn Directory>) -> Result<Arc<dyn Directory>> {
     tmp_fs_dir.mount(random_name, Node::File(random_file.clone()))?;
     let urandom_name = FileName::new(b"urandom").unwrap();
     tmp_fs_dir.mount(urandom_name, Node::File(random_file))?;
+
+    let fd_name = FileName::new(b"fd").unwrap();
+    let fd = fdfs::new(
+        Arc::downgrade(&tmp_fs_dir) as _,
+        FileMode::from_bits_truncate(0o777),
+    );
+    tmp_fs_dir.mount(fd_name, Node::Directory(fd))?;
 
     Ok(tmp_fs_dir)
 }

@@ -8,7 +8,9 @@ use alloc::{
     vec::Vec,
 };
 
-use super::{new_ino, DirEntry, DirEntryName, Directory, File, FileSnapshot, Link, Node};
+use super::{
+    new_ino, DirEntry, DirEntryName, Directory, File, FileAccessContext, FileSnapshot, Link, Node,
+};
 use crate::{
     error::{Error, Result},
     fs::path::{FileName, Path},
@@ -98,7 +100,7 @@ impl Directory for TmpFsDir {
         self.internal.lock().mode = mode;
     }
 
-    fn get_node(&self, path_segment: &FileName) -> Result<Node> {
+    fn get_node(&self, path_segment: &FileName, _ctx: &FileAccessContext) -> Result<Node> {
         self.internal
             .lock()
             .items
@@ -146,6 +148,7 @@ impl Directory for TmpFsDir {
                     Node::File(f) => Ok(f.clone()),
                     Node::Link(_) => Err(Error::exist(())),
                     Node::Directory(_) => Err(Error::exist(())),
+                    Node::Fd(_) => Err(Error::exist(())),
                 }
             }
         }
@@ -190,7 +193,7 @@ impl Directory for TmpFsDir {
         Ok(())
     }
 
-    fn list_entries(&self) -> Vec<DirEntry> {
+    fn list_entries(&self, _ctx: &FileAccessContext) -> Vec<DirEntry> {
         let guard = self.internal.lock();
 
         let mut entries = Vec::with_capacity(2 + guard.items.len());

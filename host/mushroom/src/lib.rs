@@ -4,19 +4,23 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     mem::size_of,
     ptr::NonNull,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bit_field::BitField;
-use bytemuck::NoUninit;
+use bytemuck::{bytes_of_mut, pod_read_unaligned, NoUninit};
 use constants::{
     physical_address::DYNAMIC, FINISH_OUTPUT_MSR, FIRST_AP, KICK_AP_PORT, LOG_PORT, MAX_APS_COUNT,
     MEMORY_PORT, UPDATE_OUTPUT_MSR,
 };
 use kvm::{KvmHandle, Page, VcpuHandle};
+use nix::{
+    sys::signal::{kill, signal, Signal},
+    unistd::gettid,
+};
 use snp_types::{
     ghcb::{
         self,
@@ -24,6 +28,7 @@ use snp_types::{
         Ghcb, PageSize, PageStateChangeEntry, PageStateChangeHeader,
     },
     guest_policy::GuestPolicy,
+    vmsa::{Vmsa, VmsaTweakBitmap},
     PageType,
 };
 use tracing::{debug, info};
@@ -33,7 +38,7 @@ use volatile::{
 };
 use x86_64::{
     structures::paging::{PageSize as _, PhysFrame, Size2MiB, Size4KiB},
-    PhysAddr,
+    PhysAddr, VirtAddr,
 };
 
 use crate::{
@@ -448,8 +453,29 @@ impl VmContext {
 
     fn run_ap(id: u8, vm: Arc<VmHandle>) -> JoinHandle<()> {
         std::thread::spawn(move || {
+            unsafe {
+                extern "C" fn handler(_: i32) {
+                    // dbg!("a");
+                }
+
+                signal(
+                    Signal::SIGUSR1,
+                    nix::sys::signal::SigHandler::Handler(handler),
+                )
+                .unwrap();
+            }
+
             let ap = vm.create_vcpu(i32::from(id)).unwrap();
             let kvm_run = ap.get_kvm_run_block().unwrap();
+
+            let tid = gettid();
+            std::thread::spawn(move || {
+                std::thread::sleep_ms(60_000);
+                loop {
+                    // kill(tid, Signal::SIGUSR1).unwrap();
+                    std::thread::sleep_ms(1_000);
+                }
+            });
 
             loop {
                 // Run the AP.
@@ -466,6 +492,47 @@ impl VmContext {
 
                         // Wait for the BSP to wake the AP back up.
                         std::thread::park();
+                    }
+                    KvmExit::Interrupted => {
+                        static LOCK: Mutex<()> = Mutex::new(());
+                        let _guard = LOCK.lock();
+
+                        let vmsa = vm.sev_snp_dbg_decrypt_vmsa(u32::from(id)).unwrap();
+                        let vmsa: Vmsa = pod_read_unaligned(&vmsa);
+
+                        let tweak_bitmap = &VmsaTweakBitmap::ZERO;
+
+                        let debug = vmsa.debug(tweak_bitmap);
+                        // eprintln!("{debug:#x?}");
+
+                        let mut frame_pointer = vmsa.rbp(tweak_bitmap);
+
+                        eprintln!();
+
+                        while frame_pointer != 0 {
+                            eprint!("frame: {frame_pointer:016x}, ");
+
+                            let mut rip = 0u64;
+                            let Ok(()) = vm.debug_read_va(
+                                u32::from(id),
+                                VirtAddr::new(frame_pointer + 8),
+                                bytes_of_mut(&mut rip),
+                            ) else {
+                                eprintln!();
+                                break;
+                            };
+
+                            eprintln!("rip: {rip:016x}");
+
+                            vm.debug_read_va(
+                                u32::from(id),
+                                VirtAddr::new(frame_pointer),
+                                bytes_of_mut(&mut frame_pointer),
+                            )
+                            .unwrap();
+                        }
+
+                        eprintln!();
                     }
                     exit => {
                         panic!("unexpected exit {exit:?}");

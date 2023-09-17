@@ -18,7 +18,7 @@ use crate::{
             self, create_directory, create_file, create_link,
             devtmpfs::{self, RandomFile},
             hard_link, lookup_and_resolve_node, lookup_node, read_link, rename, set_mode,
-            unlink_dir, unlink_file, DirEntry, Node, NonLinkNode, OldDirEntry,
+            unlink_dir, unlink_file, DirEntry, FileAccessContext, Node, NonLinkNode, OldDirEntry,
         },
         path::Path,
     },
@@ -56,7 +56,7 @@ use super::{
         },
         pipe,
         unix_socket::UnixSocket,
-        Events, FileDescriptorTable,
+        Events, FileDescriptor, FileDescriptorTable,
     },
     memory::{VirtualMemory, VirtualMemoryActivator},
     thread::{new_tid, Sigaction, Sigset, Stack, StackFlags, Thread, ThreadGuard, THREADS},
@@ -224,6 +224,7 @@ fn open(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     pathname: Pointer<Path>,
     flags: OpenFlags,
     mode: u64,
@@ -233,6 +234,7 @@ fn open(
         vm_activator,
         virtual_memory,
         fdtable,
+        ctx,
         FdNum::CWD,
         pathname,
         flags,
@@ -252,13 +254,14 @@ fn stat(
     vm_activator: &mut VirtualMemoryActivator,
     abi: Abi,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     filename: Pointer<Path>,
     statbuf: Pointer<Stat>,
 ) -> SyscallResult {
     vm_activator.activate(&virtual_memory, |vm| {
         let filename = vm.read(filename)?;
 
-        let node = lookup_and_resolve_node(thread.cwd.clone(), &filename)?;
+        let node = lookup_and_resolve_node(thread.cwd.clone(), &filename, &ctx)?;
         let stat = node.stat();
 
         vm.write_with_abi(statbuf, stat, abi)
@@ -272,13 +275,14 @@ fn stat64(
     thread: &mut ThreadGuard,
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     filename: Pointer<Path>,
     statbuf: Pointer<Stat>,
 ) -> SyscallResult {
     vm_activator.activate(&virtual_memory, |vm| {
         let filename = vm.read(filename)?;
 
-        let node = lookup_and_resolve_node(thread.cwd.clone(), &filename)?;
+        let node = lookup_and_resolve_node(thread.cwd.clone(), &filename, &ctx)?;
         let stat = node.stat();
         let stat64 = Stat64::from(stat);
 
@@ -311,13 +315,14 @@ fn lstat(
     vm_activator: &mut VirtualMemoryActivator,
     abi: Abi,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     filename: Pointer<Path>,
     statbuf: Pointer<Stat>,
 ) -> SyscallResult {
     vm_activator.activate(&virtual_memory, |vm| {
         let filename = vm.read(filename)?;
 
-        let node = lookup_node(thread.cwd.clone(), &filename)?;
+        let node = lookup_node(thread.cwd.clone(), &filename, &ctx)?;
         let stat = node.stat();
 
         vm.write_with_abi(statbuf, stat, abi)
@@ -331,13 +336,14 @@ fn lstat64(
     thread: &mut ThreadGuard,
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     filename: Pointer<Path>,
     statbuf: Pointer<Stat>,
 ) -> SyscallResult {
     vm_activator.activate(&virtual_memory, |vm| {
         let filename = vm.read(filename)?;
 
-        let node = lookup_node(thread.cwd.clone(), &filename)?;
+        let node = lookup_node(thread.cwd.clone(), &filename, &ctx)?;
         let stat = node.stat();
 
         let stat64 = Stat64::from(stat);
@@ -747,12 +753,13 @@ async fn writev(
 fn access(
     thread: &mut ThreadGuard,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     vm_activator: &mut VirtualMemoryActivator,
     pathname: Pointer<Path>,
     mode: u64, // FIXME: use correct type
 ) -> SyscallResult {
     let path = vm_activator.activate(&virtual_memory, |vm| vm.read(pathname))?;
-    let _node = lookup_and_resolve_node(thread.cwd.clone(), &path)?;
+    let _node = lookup_and_resolve_node(thread.cwd.clone(), &path, &ctx)?;
     // FIXME: implement the actual access checks.
     Ok(0)
 }
@@ -1082,6 +1089,7 @@ fn execve(
     vm_activator: &mut VirtualMemoryActivator,
     abi: Abi,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     pathname: Pointer<Path>,
     argv: Pointer<Pointer<CString>>,
     envp: Pointer<Pointer<CString>>,
@@ -1113,13 +1121,15 @@ fn execve(
             }
             envs.push(vm.read_cstring(envp2, 0x1000)?);
         }
+        envs.push(CString::new("NIX_DEBUG=6").unwrap());
+        envs.push(CString::new("noDumpEnvVars=1").unwrap());
 
         Result::Ok((pathname, args, envs))
     })?;
 
     log::info!("execve({pathname:?}, {args:?}, {envs:?})");
 
-    thread.execve(&pathname, &args, &envs, vm_activator)?;
+    thread.execve(&pathname, &args, &envs, &ctx, vm_activator)?;
 
     if let Some(vfork_parent) = thread.vfork_done.take() {
         let _ = vfork_parent.send(());
@@ -1307,13 +1317,14 @@ fn getdents(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     fd: FdNum,
     dirent: Pointer<[OldDirEntry]>,
     count: u64,
 ) -> SyscallResult {
     let capacity = usize::try_from(count)?;
     let fd = fdtable.get(fd)?;
-    let entries = fd.getdents64(capacity)?;
+    let entries = fd.getdents64(capacity, &ctx)?;
     let entries = entries.into_iter().map(OldDirEntry).collect::<Vec<_>>();
 
     let len = vm_activator.activate(&virtual_memory, |vm| -> Result<_> {
@@ -1327,11 +1338,12 @@ fn getdents(
 fn chdir(
     thread: &mut ThreadGuard,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     vm_activator: &mut VirtualMemoryActivator,
     path: Pointer<Path>,
 ) -> SyscallResult {
     let path = vm_activator.activate(&virtual_memory, |vm| vm.read(path))?;
-    let node = lookup_and_resolve_node(thread.cwd.clone(), &path)?;
+    let node = lookup_and_resolve_node(thread.cwd.clone(), &path, &ctx)?;
     thread.cwd = node.try_into()?;
     Ok(0)
 }
@@ -1351,13 +1363,14 @@ fn fchdir(
 fn mkdir(
     thread: &mut ThreadGuard,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     vm_activator: &mut VirtualMemoryActivator,
     pathname: Pointer<Path>,
     mode: u64,
 ) -> SyscallResult {
     let mode = FileMode::from_bits_truncate(mode);
     let pathname = vm_activator.activate(&virtual_memory, |vm| vm.read(pathname))?;
-    create_directory(thread.cwd.clone(), &pathname, mode)?;
+    create_directory(thread.cwd.clone(), &pathname, mode, &ctx)?;
     Ok(0)
 }
 
@@ -1367,6 +1380,7 @@ fn unlink(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     pathname: Pointer<Path>,
 ) -> SyscallResult {
     unlinkat(
@@ -1374,6 +1388,7 @@ fn unlink(
         vm_activator,
         virtual_memory,
         fdtable,
+        ctx,
         FdNum::CWD,
         pathname,
         UnlinkOptions::REMOVEDIR,
@@ -1386,6 +1401,7 @@ fn symlink(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     oldname: Pointer<Path>,
     newname: Pointer<Path>,
 ) -> SyscallResult {
@@ -1394,6 +1410,7 @@ fn symlink(
         vm_activator,
         virtual_memory,
         fdtable,
+        ctx,
         oldname,
         FdNum::CWD,
         newname,
@@ -1404,6 +1421,7 @@ fn symlink(
 fn readlink(
     thread: &mut ThreadGuard,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     vm_activator: &mut VirtualMemoryActivator,
     pathname: Pointer<Path>,
     buf: Pointer<[u8]>,
@@ -1413,7 +1431,7 @@ fn readlink(
 
     let len = vm_activator.activate(&virtual_memory, |vm| {
         let pathname = vm.read(pathname)?;
-        let target = read_link(thread.cwd.clone(), &pathname)?;
+        let target = read_link(thread.cwd.clone(), &pathname, &ctx)?;
 
         let bytes = target.as_bytes();
         // Truncate to `bufsiz`.
@@ -1433,13 +1451,14 @@ fn readlink(
 fn chmod(
     thread: &mut ThreadGuard,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     vm_activator: &mut VirtualMemoryActivator,
     filename: Pointer<Path>,
     mode: FileMode,
 ) -> SyscallResult {
     let path = vm_activator.activate(&virtual_memory, |vm| vm.read(filename))?;
 
-    set_mode(thread.cwd.clone(), &path, mode)?;
+    set_mode(thread.cwd.clone(), &path, mode, &ctx)?;
 
     Ok(0)
 }
@@ -1514,6 +1533,7 @@ fn arch_prctl(
 fn mount(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] ctx: FileAccessContext,
     dev_name: Pointer<Path>,
     dir_name: Pointer<Path>,
     r#type: Pointer<CString>,
@@ -1533,7 +1553,7 @@ fn mount(
         _ => return Err(Error::no_dev(())),
     };
 
-    node::mount(&dir_name, node)?;
+    node::mount(&dir_name, node, &ctx)?;
 
     Ok(0)
 }
@@ -1666,13 +1686,14 @@ fn getdents64(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     fd: FdNum,
     dirent: Pointer<[DirEntry]>,
     count: u64,
 ) -> SyscallResult {
     let capacity = usize::try_from(count)?;
     let fd = fdtable.get(fd)?;
-    let entries = fd.getdents64(capacity)?;
+    let entries = fd.getdents64(capacity, &ctx)?;
 
     let len = vm_activator.activate(&virtual_memory, |vm| -> Result<_> {
         vm.write(dirent, &*entries)
@@ -1773,6 +1794,7 @@ fn openat(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     dfd: FdNum,
     filename: Pointer<Path>,
     flags: OpenFlags,
@@ -1789,9 +1811,9 @@ fn openat(
 
     let fd = if flags.contains(OpenFlags::DIRECTORY) {
         let node = if flags.contains(OpenFlags::NOFOLLOW) {
-            lookup_node(start_dir.clone(), &filename)?
+            lookup_node(start_dir.clone(), &filename, &ctx)?
         } else {
-            Node::from(lookup_and_resolve_node(start_dir, &filename)?)
+            Node::from(lookup_and_resolve_node(start_dir, &filename, &ctx)?)
         };
 
         let dir = node.try_into()?;
@@ -1800,9 +1822,9 @@ fn openat(
         let mode = FileMode::from_bits_truncate(mode);
 
         let node = if flags.contains(OpenFlags::CREAT) {
-            NonLinkNode::File(create_file(start_dir.clone(), &filename, mode)?)
+            NonLinkNode::File(create_file(start_dir.clone(), &filename, mode, &ctx)?)
         } else {
-            lookup_and_resolve_node(start_dir.clone(), &filename)?
+            lookup_and_resolve_node(start_dir.clone(), &filename, &ctx)?
         };
         match node {
             NonLinkNode::File(file) => {
@@ -1823,6 +1845,7 @@ fn openat(
                 }
             }
             NonLinkNode::Directory(dir) => fdtable.insert(DirectoryFileDescription::new(dir))?,
+            NonLinkNode::Fd(fd) => fdtable.insert(FileDescriptor::from(fd))?,
         }
     };
     Ok(fd.get() as u64)
@@ -1845,6 +1868,7 @@ fn newfstatat(
     abi: Abi,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     dfd: FdNum,
     pathname: Pointer<Path>,
     statbuf: Pointer<Stat>,
@@ -1860,7 +1884,7 @@ fn newfstatat(
     vm_activator.activate(&virtual_memory, |vm| {
         let pathname = vm.read(pathname)?;
 
-        let node = lookup_and_resolve_node(start_dir, &pathname)?;
+        let node = lookup_and_resolve_node(start_dir, &pathname, &ctx)?;
         let stat = node.stat();
 
         vm.write_with_abi(statbuf, stat, abi)
@@ -1874,6 +1898,7 @@ fn unlinkat(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     dfd: FdNum,
     pathname: Pointer<Path>,
     flags: UnlinkOptions,
@@ -1888,9 +1913,9 @@ fn unlinkat(
     };
 
     if flags.contains(UnlinkOptions::REMOVEDIR) {
-        unlink_dir(start_dir, &pathname)?;
+        unlink_dir(start_dir, &pathname, &ctx)?;
     } else {
-        unlink_file(start_dir, &pathname)?;
+        unlink_file(start_dir, &pathname, &ctx)?;
     }
 
     Ok(0)
@@ -1902,6 +1927,7 @@ fn linkat(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     olddirfd: FdNum,
     oldpath: Pointer<Path>,
     newdirfd: FdNum,
@@ -1933,6 +1959,7 @@ fn linkat(
         olddir,
         &oldpath,
         flags.contains(LinkOptions::SYMLINK_FOLLOW),
+        &ctx,
     )?;
 
     Ok(0)
@@ -1944,6 +1971,7 @@ fn symlinkat(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     oldname: Pointer<Path>,
     newdfd: FdNum,
     newname: Pointer<Path>,
@@ -1961,7 +1989,7 @@ fn symlinkat(
         Result::<_, Error>::Ok((oldname, newname))
     })?;
 
-    create_link(newdfd, &newname, oldname)?;
+    create_link(newdfd, &newname, oldname, &ctx)?;
 
     Ok(0)
 }
@@ -1972,6 +2000,7 @@ fn fchmodat(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     dfd: FdNum,
     filename: Pointer<Path>,
     mode: FileMode,
@@ -1985,7 +2014,7 @@ fn fchmodat(
 
     let path = vm_activator.activate(&virtual_memory, |vm| vm.read(filename))?;
 
-    set_mode(newdfd, &path, mode)?;
+    set_mode(newdfd, &path, mode, &ctx)?;
 
     Ok(0)
 }
@@ -2042,6 +2071,7 @@ fn renameat2(
     vm_activator: &mut VirtualMemoryActivator,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     olddfd: FdNum,
     oldname: Pointer<Path>,
     newdfd: FdNum,
@@ -2066,7 +2096,7 @@ fn renameat2(
         Ok((vm.read(oldname)?, vm.read(newname)?))
     })?;
 
-    rename(oldd, &oldname, newd, &newname)?;
+    rename(oldd, &oldname, newd, &newname, &ctx)?;
 
     Ok(0)
 }

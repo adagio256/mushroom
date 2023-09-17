@@ -4,7 +4,12 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::spin::lazy::Lazy;
+use crate::{
+    spin::lazy::Lazy,
+    user::process::{
+        fd::FileDescriptorTable, syscall::args::ExtractableThreadState, thread::ThreadGuard,
+    },
+};
 use alloc::{
     borrow::Cow,
     sync::{Arc, Weak},
@@ -20,17 +25,18 @@ use crate::{
     },
 };
 
-use self::tmpfs::TmpFsDir;
+use self::{fdfs::FdNode, tmpfs::TmpFsDir};
 
 use super::path::{FileName, Path, PathSegment};
 
 pub mod devtmpfs;
+pub mod fdfs;
 pub mod tmpfs;
 
 pub static ROOT_NODE: Lazy<Arc<TmpFsDir>> =
     Lazy::new(|| TmpFsDir::root(FileMode::from_bits_truncate(0o755)));
 
-fn new_ino() -> u64 {
+pub fn new_ino() -> u64 {
     static INO_COUNTER: AtomicU64 = AtomicU64::new(1);
     INO_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
@@ -39,25 +45,32 @@ fn new_ino() -> u64 {
 pub enum Node {
     File(Arc<dyn File>),
     Directory(Arc<dyn Directory>),
+    Fd(FdNode),
     Link(Link),
 }
 
 impl Node {
-    fn resolve_link(self, start_dir: Arc<dyn Directory>) -> Result<NonLinkNode> {
-        self.resolve_link_recursive(start_dir, &mut 16)
+    fn resolve_link(
+        self,
+        start_dir: Arc<dyn Directory>,
+        ctx: &FileAccessContext,
+    ) -> Result<NonLinkNode> {
+        self.resolve_link_recursive(start_dir, &mut 16, ctx)
     }
 
     fn resolve_link_recursive(
         self,
         start_dir: Arc<dyn Directory>,
         recursion: &mut u8,
+        ctx: &FileAccessContext,
     ) -> Result<NonLinkNode> {
         match self {
             Node::File(file) => Ok(NonLinkNode::File(file)),
             Node::Directory(dir) => Ok(NonLinkNode::Directory(dir)),
+            Node::Fd(fd) => Ok(NonLinkNode::Fd(fd)),
             Node::Link(link) => {
                 *recursion = recursion.checked_sub(1).ok_or_else(|| Error::r#loop(()))?;
-                lookup_and_resolve_node_recursive(start_dir, &link.target, recursion)
+                lookup_and_resolve_node_recursive(start_dir, &link.target, recursion, ctx)
             }
         }
     }
@@ -66,6 +79,7 @@ impl Node {
         match self {
             Node::File(file) => file.stat(),
             Node::Directory(dir) => dir.stat(),
+            Node::Fd(fd) => fd.stat(),
             Node::Link(link) => link.stat(),
         }
     }
@@ -74,6 +88,7 @@ impl Node {
 pub enum NonLinkNode {
     File(Arc<dyn File>),
     Directory(Arc<dyn Directory>),
+    Fd(FdNode),
 }
 
 impl NonLinkNode {
@@ -81,6 +96,7 @@ impl NonLinkNode {
         match self {
             NonLinkNode::File(file) => file.stat(),
             NonLinkNode::Directory(dir) => dir.stat(),
+            NonLinkNode::Fd(fd) => fd.stat(),
         }
     }
 
@@ -88,6 +104,7 @@ impl NonLinkNode {
         match self {
             NonLinkNode::File(file) => file.set_mode(mode),
             NonLinkNode::Directory(dir) => dir.set_mode(mode),
+            NonLinkNode::Fd(_fd) => {}
         }
     }
 }
@@ -99,7 +116,7 @@ impl TryFrom<NonLinkNode> for Arc<dyn File> {
     fn try_from(value: NonLinkNode) -> Result<Self> {
         match value {
             NonLinkNode::File(file) => Ok(file),
-            NonLinkNode::Directory(_) => Err(Error::is_dir(())),
+            NonLinkNode::Directory(_) | NonLinkNode::Fd(_) => Err(Error::is_dir(())),
         }
     }
 }
@@ -110,7 +127,7 @@ impl TryFrom<NonLinkNode> for Arc<dyn Directory> {
     #[track_caller]
     fn try_from(value: NonLinkNode) -> Result<Self> {
         match value {
-            NonLinkNode::File(_) => Err(Error::not_dir(())),
+            NonLinkNode::File(_) | NonLinkNode::Fd(_) => Err(Error::not_dir(())),
             NonLinkNode::Directory(dir) => Ok(dir),
         }
     }
@@ -125,6 +142,7 @@ impl TryFrom<Node> for Arc<dyn Directory> {
             Node::File(_) => Err(Error::not_dir(())),
             Node::Directory(dir) => Ok(dir),
             Node::Link(_) => Err(Error::not_dir(())),
+            Node::Fd(_) => Err(Error::not_dir(())),
         }
     }
 }
@@ -134,6 +152,7 @@ impl From<NonLinkNode> for Node {
         match value {
             NonLinkNode::File(file) => Self::File(file),
             NonLinkNode::Directory(dir) => Self::Directory(dir),
+            NonLinkNode::Fd(fd) => Self::Fd(fd),
         }
     }
 }
@@ -246,7 +265,7 @@ pub trait Directory: Any + Send + Sync {
     fn parent(&self) -> Result<Arc<dyn Directory>>;
     fn stat(&self) -> Stat;
     fn set_mode(&self, mode: FileMode);
-    fn get_node(&self, file_name: &FileName) -> Result<Node>;
+    fn get_node(&self, file_name: &FileName, ctx: &FileAccessContext) -> Result<Node>;
     fn create_file(
         &self,
         file_name: FileName<'static>,
@@ -266,12 +285,24 @@ pub trait Directory: Any + Send + Sync {
     ) -> Result<()>;
     fn hard_link(&self, file_name: FileName<'static>, node: Node) -> Result<()>;
     fn mount(&self, file_name: FileName<'static>, node: Node) -> Result<()>;
-    fn list_entries(&self) -> Vec<DirEntry>;
+    fn list_entries(&self, ctx: &FileAccessContext) -> Vec<DirEntry>;
     fn delete_non_dir(&self, file_name: FileName<'static>) -> Result<()>;
     fn delete_dir(&self, file_name: FileName<'static>) -> Result<()>;
 
     fn mode(&self) -> FileMode {
         self.stat().mode.mode()
+    }
+}
+
+pub struct FileAccessContext {
+    pub fdtable: Arc<FileDescriptorTable>,
+}
+
+impl ExtractableThreadState for FileAccessContext {
+    fn extract_from_thread(guard: &ThreadGuard) -> Self {
+        Self {
+            fdtable: ExtractableThreadState::extract_from_thread(guard),
+        }
     }
 }
 
@@ -348,8 +379,12 @@ impl Link {
 }
 
 /// Find a node.
-pub fn lookup_node(start_dir: Arc<dyn Directory>, path: &Path) -> Result<Node> {
-    let (_, node) = lookup_node_recursive(start_dir, path, &mut 16)?;
+pub fn lookup_node(
+    start_dir: Arc<dyn Directory>,
+    path: &Path,
+    ctx: &FileAccessContext,
+) -> Result<Node> {
+    let (_, node) = lookup_node_recursive(start_dir, path, &mut 16, ctx)?;
     Ok(node)
 }
 
@@ -358,11 +393,12 @@ fn lookup_node_recursive(
     start_dir: Arc<dyn Directory>,
     path: &Path,
     recursion: &mut u8,
+    ctx: &FileAccessContext,
 ) -> Result<(Arc<dyn Directory>, Node)> {
     let res = path.segments().try_fold(
         (start_dir.clone(), Node::Directory(start_dir)),
         |(start_dir, node), segment| -> Result<_> {
-            let node = node.resolve_link_recursive(start_dir.clone(), recursion)?;
+            let node = node.resolve_link_recursive(start_dir.clone(), recursion, ctx)?;
             let dir = <Arc<dyn Directory>>::try_from(node)?;
 
             match segment {
@@ -374,7 +410,7 @@ fn lookup_node_recursive(
                 }
                 PathSegment::FileName(file_name) => {
                     *recursion = recursion.checked_sub(1).ok_or_else(|| Error::r#loop(()))?;
-                    let node = dir.get_node(&file_name)?;
+                    let node = dir.get_node(&file_name, ctx)?;
                     Ok((dir, node))
                 }
             }
@@ -384,8 +420,12 @@ fn lookup_node_recursive(
 }
 
 // Find a node and resolve links.
-pub fn lookup_and_resolve_node(start_dir: Arc<dyn Directory>, path: &Path) -> Result<NonLinkNode> {
-    lookup_and_resolve_node_recursive(start_dir, path, &mut 16)
+pub fn lookup_and_resolve_node(
+    start_dir: Arc<dyn Directory>,
+    path: &Path,
+    ctx: &FileAccessContext,
+) -> Result<NonLinkNode> {
+    lookup_and_resolve_node_recursive(start_dir, path, &mut 16, ctx)
 }
 
 // Find a node and resolve links while taking recursion limits into account.
@@ -393,15 +433,17 @@ fn lookup_and_resolve_node_recursive(
     start_dir: Arc<dyn Directory>,
     path: &Path,
     recursion: &mut u8,
+    ctx: &FileAccessContext,
 ) -> Result<NonLinkNode> {
-    let (dir, node) = lookup_node_recursive(start_dir.clone(), path, recursion)?;
-    node.resolve_link_recursive(dir, recursion)
+    let (dir, node) = lookup_node_recursive(start_dir.clone(), path, recursion, ctx)?;
+    node.resolve_link_recursive(dir, recursion, ctx)
 }
 
-fn find_parent(
+fn find_parent<'a>(
     start_dir: Arc<dyn Directory>,
-    path: &Path,
-) -> Result<(Arc<dyn Directory>, PathSegment)> {
+    path: &'a Path,
+    ctx: &FileAccessContext,
+) -> Result<(Arc<dyn Directory>, PathSegment<'a>)> {
     let mut segments = path.segments();
     let first = segments.next().ok_or_else(|| Error::inval(()))?;
     segments.try_fold((start_dir, first), |(dir, segment), next_segment| {
@@ -410,8 +452,8 @@ fn find_parent(
             PathSegment::Empty | PathSegment::Dot => dir,
             PathSegment::DotDot => unreachable!(),
             PathSegment::FileName(file_name) => {
-                let node = dir.get_node(&file_name)?;
-                let node = node.resolve_link(dir.clone())?;
+                let node = dir.get_node(&file_name, ctx)?;
+                let node = node.resolve_link(dir.clone(), ctx)?;
                 <Arc<dyn Directory>>::try_from(node)?
             }
         };
@@ -423,8 +465,9 @@ pub fn create_file(
     start_dir: Arc<dyn Directory>,
     path: &Path,
     mode: FileMode,
+    ctx: &FileAccessContext,
 ) -> Result<Arc<dyn File>> {
-    let (dir, last) = find_parent(start_dir, path)?;
+    let (dir, last) = find_parent(start_dir, path, ctx)?;
     let file_name = match last {
         PathSegment::Root => todo!(),
         PathSegment::Empty => todo!(),
@@ -440,8 +483,9 @@ pub fn create_directory(
     start_dir: Arc<dyn Directory>,
     path: &Path,
     mode: FileMode,
+    ctx: &FileAccessContext,
 ) -> Result<Arc<dyn Directory>> {
-    let (dir, last) = find_parent(start_dir, path)?;
+    let (dir, last) = find_parent(start_dir, path, ctx)?;
     match last {
         PathSegment::Root | PathSegment::Empty | PathSegment::Dot | PathSegment::DotDot => {
             Err(Error::exist(()))
@@ -450,8 +494,13 @@ pub fn create_directory(
     }
 }
 
-pub fn create_link(start_dir: Arc<dyn Directory>, path: &Path, target: Path) -> Result<()> {
-    let (dir, last) = find_parent(start_dir, path)?;
+pub fn create_link(
+    start_dir: Arc<dyn Directory>,
+    path: &Path,
+    target: Path,
+    ctx: &FileAccessContext,
+) -> Result<()> {
+    let (dir, last) = find_parent(start_dir, path, ctx)?;
     let file_name = match last {
         PathSegment::Root => todo!(),
         PathSegment::Empty => todo!(),
@@ -463,19 +512,24 @@ pub fn create_link(start_dir: Arc<dyn Directory>, path: &Path, target: Path) -> 
     Ok(())
 }
 
-pub fn read_link(start_dir: Arc<dyn Directory>, path: &Path) -> Result<Path> {
-    let node = lookup_node(start_dir, path)?;
+pub fn read_link(
+    start_dir: Arc<dyn Directory>,
+    path: &Path,
+    ctx: &FileAccessContext,
+) -> Result<Path> {
+    let node = lookup_node(start_dir, path, ctx)?;
     match node {
         Node::Link(link) => Ok(link.target),
-        Node::File(_) | Node::Directory(_) => Err(Error::inval(())),
+        Node::File(_) | Node::Directory(_) | Node::Fd(_) => Err(Error::inval(())),
     }
 }
 
 pub fn mount(
     path: &Path,
     create_node: impl FnOnce(Weak<dyn Directory>) -> Result<Node>,
+    ctx: &FileAccessContext,
 ) -> Result<()> {
-    let (dir, last) = find_parent(ROOT_NODE.clone(), path)?;
+    let (dir, last) = find_parent(ROOT_NODE.clone(), path, ctx)?;
     let file_name = match last {
         PathSegment::Root => todo!(),
         PathSegment::Empty => todo!(),
@@ -488,14 +542,23 @@ pub fn mount(
     Ok(())
 }
 
-pub fn set_mode(start_dir: Arc<dyn Directory>, path: &Path, mode: FileMode) -> Result<()> {
-    let node = lookup_and_resolve_node(start_dir, path)?;
+pub fn set_mode(
+    start_dir: Arc<dyn Directory>,
+    path: &Path,
+    mode: FileMode,
+    ctx: &FileAccessContext,
+) -> Result<()> {
+    let node = lookup_and_resolve_node(start_dir, path, ctx)?;
     node.set_mode(mode);
     Ok(())
 }
 
-pub fn unlink_file(start_dir: Arc<dyn Directory>, path: &Path) -> Result<()> {
-    let (parent, segment) = find_parent(start_dir, path)?;
+pub fn unlink_file(
+    start_dir: Arc<dyn Directory>,
+    path: &Path,
+    ctx: &FileAccessContext,
+) -> Result<()> {
+    let (parent, segment) = find_parent(start_dir, path, ctx)?;
     match segment {
         PathSegment::Root | PathSegment::Empty | PathSegment::Dot | PathSegment::DotDot => {
             Err(Error::is_dir(()))
@@ -504,8 +567,12 @@ pub fn unlink_file(start_dir: Arc<dyn Directory>, path: &Path) -> Result<()> {
     }
 }
 
-pub fn unlink_dir(start_dir: Arc<dyn Directory>, path: &Path) -> Result<()> {
-    let (parent, segment) = find_parent(start_dir, path)?;
+pub fn unlink_dir(
+    start_dir: Arc<dyn Directory>,
+    path: &Path,
+    ctx: &FileAccessContext,
+) -> Result<()> {
+    let (parent, segment) = find_parent(start_dir, path, ctx)?;
     match segment {
         PathSegment::Root => todo!(),
         PathSegment::Empty => todo!(),
@@ -521,13 +588,14 @@ pub fn hard_link(
     target_dir: Arc<dyn Directory>,
     target_path: &Path,
     symlink_follow: bool,
+    ctx: &FileAccessContext,
 ) -> Result<()> {
     let target_node = if symlink_follow {
-        Node::from(lookup_and_resolve_node(target_dir, target_path)?)
+        Node::from(lookup_and_resolve_node(target_dir, target_path, ctx)?)
     } else {
-        lookup_node(target_dir, target_path)?
+        lookup_node(target_dir, target_path, ctx)?
     };
-    let (parent, filename) = find_parent(start_dir, start_path)?;
+    let (parent, filename) = find_parent(start_dir, start_path, ctx)?;
     match filename {
         PathSegment::Root => todo!(),
         PathSegment::Empty => todo!(),
@@ -542,8 +610,9 @@ pub fn rename(
     oldname: &Path,
     newd: Arc<dyn Directory>,
     newname: &Path,
+    ctx: &FileAccessContext,
 ) -> Result<()> {
-    let (old_parent, segment) = find_parent(oldd, oldname)?;
+    let (old_parent, segment) = find_parent(oldd, oldname, ctx)?;
     let oldname = match segment {
         PathSegment::Root | PathSegment::Empty | PathSegment::Dot | PathSegment::DotDot => {
             return Err(Error::is_dir(()))
@@ -551,7 +620,7 @@ pub fn rename(
         PathSegment::FileName(filename) => filename,
     };
 
-    let (new_parent, segment) = find_parent(newd, newname)?;
+    let (new_parent, segment) = find_parent(newd, newname, ctx)?;
     let newname = match segment {
         PathSegment::Root | PathSegment::Empty | PathSegment::Dot | PathSegment::DotDot => {
             return Err(Error::is_dir(()))
@@ -559,7 +628,7 @@ pub fn rename(
         PathSegment::FileName(filename) => filename,
     };
 
-    let node = old_parent.get_node(&oldname)?;
+    let node = old_parent.get_node(&oldname, ctx)?;
     new_parent.mount(newname.into_owned(), node)?;
     old_parent.delete_non_dir(oldname.into_owned())?;
 

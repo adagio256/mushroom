@@ -1,6 +1,9 @@
-use core::{any::type_name, cmp, ops::Deref};
+use core::{any::type_name, cmp, iter::from_fn, ops::Deref};
 
-use crate::spin::mutex::Mutex;
+use crate::{
+    fs::node::{new_ino, FileAccessContext},
+    spin::mutex::Mutex,
+};
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use async_trait::async_trait;
 use bitflags::bitflags;
@@ -26,14 +29,26 @@ mod std;
 pub mod unix_socket;
 
 #[derive(Clone)]
-pub struct FileDescriptor(Arc<dyn OpenFileDescription>);
+pub struct FileDescriptor {
+    ino: u64,
+    fd: Arc<dyn OpenFileDescription>,
+}
+
+impl FileDescriptor {
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+}
 
 impl<T> From<T> for FileDescriptor
 where
     T: OpenFileDescription,
 {
     fn from(value: T) -> Self {
-        FileDescriptor(Arc::new(value))
+        Self {
+            ino: new_ino(),
+            fd: Arc::new(value),
+        }
     }
 }
 
@@ -41,7 +56,7 @@ impl Deref for FileDescriptor {
     type Target = dyn OpenFileDescription;
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &*self.fd
     }
 }
 
@@ -116,6 +131,14 @@ impl FileDescriptorTable {
             .remove(&fd_num.get())
             .ok_or(Error::bad_f(()))?;
         fd.close()
+    }
+
+    pub fn nums(&self) -> Vec<(FdNum, FileDescriptor)> {
+        let guard = self.table.lock();
+        guard
+            .iter()
+            .map(|(&num, fd)| (FdNum::new(num), fd.clone()))
+            .collect()
     }
 }
 
@@ -228,7 +251,7 @@ pub trait OpenFileDescription: Send + Sync + 'static {
         Err(Error::not_dir(()))
     }
 
-    fn getdents64(&self, capacity: usize) -> Result<Vec<DirEntry>> {
+    fn getdents64(&self, capacity: usize, ctx: &FileAccessContext) -> Result<Vec<DirEntry>> {
         let _ = capacity;
         Err(Error::not_dir(()))
     }

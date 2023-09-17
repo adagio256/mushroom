@@ -4,7 +4,10 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::spin::mutex::{Mutex, MutexGuard};
+use crate::{
+    fs::node::FileAccessContext,
+    spin::mutex::{Mutex, MutexGuard},
+};
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -352,16 +355,17 @@ impl ThreadGuard<'_> {
         path: &Path,
         argv: &[impl AsRef<CStr>],
         envp: &[impl AsRef<CStr>],
+        ctx: &FileAccessContext,
         vm_activator: &mut VirtualMemoryActivator,
     ) -> Result<()> {
-        let node = lookup_and_resolve_node(ROOT_NODE.clone(), path)?;
+        let node = lookup_and_resolve_node(ROOT_NODE.clone(), path, ctx)?;
         let file: Arc<dyn File> = node.try_into()?;
         if !file.mode().contains(FileMode::EXECUTE) {
             return Err(Error::acces(()));
         }
         let bytes = file.read_snapshot()?;
 
-        self.start_executable(bytes, argv, envp, vm_activator)
+        self.start_executable(bytes, argv, envp, ctx, vm_activator)
     }
 
     pub fn start_executable(
@@ -369,13 +373,15 @@ impl ThreadGuard<'_> {
         bytes: FileSnapshot,
         argv: &[impl AsRef<CStr>],
         envp: &[impl AsRef<CStr>],
+        ctx: &FileAccessContext,
         vm_activator: &mut VirtualMemoryActivator,
     ) -> Result<()> {
         let virtual_memory = VirtualMemory::new();
 
         // Load the elf.
-        let cpu_state =
-            vm_activator.activate(&virtual_memory, |vm| vm.start_executable(bytes, argv, envp))?;
+        let cpu_state = vm_activator.activate(&virtual_memory, |vm| {
+            vm.start_executable(bytes, argv, envp, ctx)
+        })?;
 
         // Success! Commit the new state to the thread.
 

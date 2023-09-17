@@ -1,4 +1,4 @@
-use crate::spin::mutex::Mutex;
+use crate::{fs::node::FileAccessContext, spin::mutex::Mutex};
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
@@ -32,9 +32,9 @@ impl OpenFileDescription for DirectoryFileDescription {
         Ok(self.dir.clone())
     }
 
-    fn getdents64(&self, mut capacity: usize) -> Result<Vec<DirEntry>> {
+    fn getdents64(&self, mut capacity: usize, ctx: &FileAccessContext) -> Result<Vec<DirEntry>> {
         let mut guard = self.entries.lock();
-        let entries = guard.get_or_insert_with(|| self.dir.list_entries());
+        let entries = guard.get_or_insert_with(|| self.dir.list_entries(ctx));
 
         let mut ret = Vec::new();
         while let Some(last) = entries.last() {
