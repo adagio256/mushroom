@@ -58,6 +58,10 @@ pub trait INode: Send + Sync + 'static {
 
     // Directory related functions.
 
+    fn path(&self, ctx: &mut FileAccessContext) -> Result<Path> {
+        Err(Error::not_dir(()))
+    }
+
     fn parent(&self) -> Result<DynINode> {
         Err(Error::not_dir(()))
     }
@@ -73,6 +77,7 @@ pub trait INode: Send + Sync + 'static {
         file_name: FileName<'static>,
         mode: FileMode,
         create_new: bool,
+        ctx: &mut FileAccessContext,
     ) -> Result<DynINode> {
         let _ = file_name;
         let _ = mode;
@@ -290,6 +295,7 @@ pub fn create_file(
     start_dir: DynINode,
     path: &Path,
     mode: FileMode,
+    create_new: bool,
     ctx: &mut FileAccessContext,
 ) -> Result<DynINode> {
     let (dir, last) = find_parent(start_dir, path, ctx)?;
@@ -300,7 +306,7 @@ pub fn create_file(
         PathSegment::DotDot => todo!(),
         PathSegment::FileName(file_name) => file_name,
     };
-    let file = dir.create_file(file_name.into_owned(), mode, false)?;
+    let file = dir.create_file(file_name.into_owned(), mode, create_new, ctx)?;
     Ok(file)
 }
 

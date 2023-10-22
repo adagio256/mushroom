@@ -117,6 +117,11 @@ impl<const N: usize> Block<N> {
             prev = Some(entry_ptr);
         }
 
+        #[cfg(sanitize = "address")]
+        unsafe {
+            crate::sanitize::mark(entry_ptr.cast(), len_for_entries, false);
+        }
+
         let block = Block {
             next: None,
             memory: ptr,
@@ -160,36 +165,37 @@ unsafe impl<const N: usize> Allocator for Block<N> {
         assert!(layout.size() <= N);
         assert!(layout.align() <= align_of::<Entry<N>>());
 
+        assert_eq!(layout.size() % layout.align(), 0);
+
         let ptr = self.free_list.get().ok_or(AllocError)?;
-        let next_ptr = unsafe { (*ptr.as_ptr()).next };
+        let next_ptr = unsafe { (*ptr.as_ptr()).next() };
         self.free_list.set(next_ptr);
 
         #[cfg(sanitize = "address")]
         unsafe {
-            crate::sanitize::mark(ptr.as_ptr().cast_const().cast::<_>(), N, true);
+            crate::sanitize::mark(
+                ptr.as_ptr().cast_const().cast::<_>(),
+                layout.size().next_multiple_of(8),
+                true,
+            );
         }
 
-        let ptr = core::ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<u8>(), N);
+        let ptr = core::ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast::<u8>(), layout.size());
         Ok(NonNull::new(ptr).unwrap())
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, _layout: Layout) {
         #[cfg(sanitize = "address")]
         unsafe {
-            crate::sanitize::mark(
-                ptr.as_ptr().byte_add(8).cast_const().cast::<_>(),
-                N - 8,
-                false,
-            );
+            crate::sanitize::mark(ptr.as_ptr().cast_const().cast::<_>(), N, false);
         }
 
         let entry = ptr.cast::<Entry<N>>();
 
         let current_free_list = self.free_list.get();
 
-        let next_ptr = addr_of_mut!((*entry.as_ptr()).next);
         unsafe {
-            next_ptr.write(current_free_list);
+            (*entry.as_ptr()).set_next(current_free_list);
         }
 
         self.free_list.set(Some(entry));
@@ -200,4 +206,37 @@ unsafe impl<const N: usize> Allocator for Block<N> {
 union Entry<const N: usize> {
     next: Option<NonNull<Self>>,
     raw: [u8; N],
+}
+
+impl<const N: usize> Entry<N> {
+    #[cfg(not(sanitize = "address"))]
+    unsafe fn next(&self) -> Option<NonNull<Self>> {
+        unsafe { self.next }
+    }
+
+    #[cfg(sanitize = "address")]
+    unsafe fn next(&self) -> Option<NonNull<Self>> {
+        use core::arch::asm;
+
+        let next: *mut Entry<N>;
+        unsafe {
+            asm!("mov {next}, qword ptr [{this}]", this = in(reg) self, next = lateout(reg) next);
+        }
+        NonNull::new(next)
+    }
+
+    #[cfg(not(sanitize = "address"))]
+    fn set_next(&mut self, next: Option<NonNull<Self>>) {
+        self.next = next;
+    }
+
+    #[cfg(sanitize = "address")]
+    fn set_next(&mut self, next: Option<NonNull<Self>>) {
+        use core::{arch::asm, ptr::null_mut};
+
+        let next = next.map_or(null_mut(), NonNull::as_ptr);
+        unsafe {
+            asm!("mov qword ptr [{this}], {next}", this = in(reg) self, next = in(reg) next);
+        }
+    }
 }

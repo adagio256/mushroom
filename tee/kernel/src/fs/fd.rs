@@ -26,6 +26,7 @@ pub mod dir;
 pub mod epoll;
 pub mod eventfd;
 pub mod file;
+pub mod path;
 pub mod pipe;
 mod std;
 pub mod unix_socket;
@@ -224,7 +225,8 @@ pub trait OpenFileDescription: Send + Sync + 'static {
     fn seek(&self, offset: usize, whence: Whence) -> Result<usize> {
         let _ = offset;
         let _ = whence;
-        Err(Error::inval(()))
+        debug!("unimplemented seek for {}", core::any::type_name::<Self>());
+        Err(Error::s_pipe(()))
     }
 
     fn pread(&self, pos: usize, buf: &mut [u8]) -> Result<usize> {
@@ -262,7 +264,8 @@ pub trait OpenFileDescription: Send + Sync + 'static {
         self.stat().mode.ty()
     }
 
-    fn as_dir(&self) -> Result<DynINode> {
+    fn as_dir(&self, ctx: &mut FileAccessContext) -> Result<DynINode> {
+        let _ = ctx;
         Err(Error::not_dir(()))
     }
 

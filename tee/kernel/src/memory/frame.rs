@@ -168,6 +168,8 @@ unsafe impl FrameAllocator<Size4KiB> for &BitmapFrameAllocator {
 
 impl FrameDeallocator<Size4KiB> for &BitmapFrameAllocator {
     unsafe fn deallocate_frame(&mut self, frame: PhysFrame) {
+        return;
+
         let mut state = self.state.lock();
         let mut i = 0;
         loop {

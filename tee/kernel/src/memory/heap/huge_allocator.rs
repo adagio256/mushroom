@@ -55,6 +55,8 @@ where
             addr.next_multiple_of(align)
         };
 
+        assert!(HEAP.contains(addr));
+
         let addr = VirtAddr::new(addr);
         let base = Page::<Size4KiB>::from_start_address(addr).unwrap();
 

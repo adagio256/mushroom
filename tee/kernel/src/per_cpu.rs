@@ -1,6 +1,7 @@
 use core::{
     arch::asm,
     cell::{Cell, OnceCell, RefCell},
+    panic::Location,
     ptr::null_mut,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -35,6 +36,7 @@ pub struct PerCpu {
     pub userspace64_registers: Cell<amd64::UserspaceRegisters>,
     pub reserved_frame_storage: RefCell<ReservedFrameStorage>,
     pub temporary_mapping: OnceCell<RefCell<Page>>,
+    pub temporary_mapping_used: RefCell<Option<&'static Location<'static>>>,
     pub tss: OnceCell<TaskStateSegment>,
     pub gdt: OnceCell<GlobalDescriptorTable>,
     pub current_virtual_memory: Cell<Option<Arc<VirtualMemory>>>,
@@ -51,6 +53,7 @@ impl PerCpu {
             userspace64_registers: Cell::new(amd64::UserspaceRegisters::ZERO),
             reserved_frame_storage: RefCell::new(ReservedFrameStorage::new()),
             temporary_mapping: OnceCell::new(),
+            temporary_mapping_used: RefCell::new(None),
             tss: OnceCell::new(),
             gdt: OnceCell::new(),
             current_virtual_memory: Cell::new(None),

@@ -1,6 +1,6 @@
 use crate::{
     fs::{
-        node::{FileAccessContext, INode, DynINode},
+        node::{DirEntryName, DynINode, FileAccessContext, INode},
         path::{FileName, Path},
     },
     spin::mutex::Mutex,
@@ -23,6 +23,10 @@ macro_rules! dir_impls {
             Directory::parent(self)
         }
 
+        fn path(&self, ctx: &mut FileAccessContext) -> Result<Path> {
+            Directory::path(self, ctx)
+        }
+
         fn get_node(&self, file_name: &FileName, ctx: &FileAccessContext) -> Result<DynINode> {
             Directory::get_node(self, file_name, ctx)
         }
@@ -32,8 +36,9 @@ macro_rules! dir_impls {
             file_name: FileName<'static>,
             mode: FileMode,
             create_new: bool,
+            ctx: &mut FileAccessContext,
         ) -> Result<DynINode> {
-            Directory::create_file(self, file_name, mode, create_new)
+            Directory::create_file(self, file_name, mode, create_new, ctx)
         }
 
         fn create_dir(&self, file_name: FileName<'static>, mode: FileMode) -> Result<DynINode> {
@@ -69,12 +74,41 @@ macro_rules! dir_impls {
 
 pub trait Directory: INode {
     fn parent(&self) -> Result<DynINode>;
+    fn path(&self, ctx: &mut FileAccessContext) -> Result<Path> {
+        let parent = Directory::parent(self)?;
+
+        let stat = self.stat();
+        let parent_stat = parent.stat();
+
+        // If the directory is its own parent, then it's the root.
+        if parent_stat.ino == stat.ino {
+            return Path::new(b"/".to_vec());
+        }
+
+        let mut path = parent.path(ctx)?;
+
+        // Find the directory in its parent.
+        let entries = parent.list_entries(ctx)?;
+        let entry = entries
+            .into_iter()
+            .find(|e| e.ino == stat.ino)
+            .ok_or_else(|| Error::no_ent(()))?;
+
+        let DirEntryName::FileName(name) = entry.name else {
+            unreachable!()
+        };
+
+        path.join_segment(&name);
+
+        Ok(path)
+    }
     fn get_node(&self, file_name: &FileName, ctx: &FileAccessContext) -> Result<DynINode>;
     fn create_file(
         &self,
         file_name: FileName<'static>,
         mode: FileMode,
         create_new: bool,
+        ctx: &mut FileAccessContext,
     ) -> Result<DynINode>;
     fn create_dir(&self, file_name: FileName<'static>, mode: FileMode) -> Result<DynINode>;
     fn create_link(
@@ -106,7 +140,8 @@ impl OpenFileDescription for DirectoryFileDescription {
         self.dir.stat()
     }
 
-    fn as_dir(&self) -> Result<DynINode> {
+    fn as_dir(&self, ctx: &mut FileAccessContext) -> Result<DynINode> {
+        let _ = ctx;
         Ok(self.dir.clone())
     }
 

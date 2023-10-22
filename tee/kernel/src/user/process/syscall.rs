@@ -9,14 +9,16 @@ use alloc::{ffi::CString, sync::Arc, vec::Vec};
 use bit_field::BitField;
 use bytemuck::{bytes_of, bytes_of_mut, Zeroable};
 use kernel_macros::syscall;
+use log::debug;
 use x86_64::VirtAddr;
 
 use crate::{
     error::{Error, Result},
     fs::{
         fd::{
-            do_io, do_io_with_vm, epoll::Epoll, eventfd::EventFd, pipe, unix_socket::UnixSocket,
-            Events, FileDescriptorTable,
+            do_io, do_io_with_vm, epoll::Epoll, eventfd::EventFd, path::PathFd, pipe,
+            unix_socket::UnixSocket, Events, FileDescriptor, FileDescriptorTable,
+            OpenFileDescription,
         },
         node::{
             self, create_directory, create_file, create_link,
@@ -129,6 +131,7 @@ const SYSCALL_HANDLERS: SyscallHandlers = {
     handlers.register(SysFcntl);
     handlers.register(SysFcntl64);
     handlers.register(SysGetdents);
+    handlers.register(SysGetcwd);
     handlers.register(SysChdir);
     handlers.register(SysFchdir);
     handlers.register(SysMkdir);
@@ -148,6 +151,7 @@ const SYSCALL_HANDLERS: SyscallHandlers = {
     handlers.register(SysSetTidAddress);
     handlers.register(SysClockGettime);
     handlers.register(SysOpenat);
+    handlers.register(SysMkdirat);
     handlers.register(SysExitGroup);
     handlers.register(SysEpollWait);
     handlers.register(SysEpollCtl);
@@ -157,6 +161,8 @@ const SYSCALL_HANDLERS: SyscallHandlers = {
     handlers.register(SysLinkat);
     handlers.register(SysSymlinkat);
     handlers.register(SysFchmodat);
+    handlers.register(SysFaccessat);
+    handlers.register(SysUtimensat);
     handlers.register(SysEventfd);
     handlers.register(SysEpollCreate1);
     handlers.register(SysPipe2);
@@ -190,6 +196,7 @@ async fn read(
 
 #[syscall(i386 = 4, amd64 = 1)]
 async fn write(
+    thread: Arc<Thread>,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
     fd: FdNum,
@@ -254,6 +261,7 @@ fn stat(
 
         let node = lookup_and_resolve_node(thread.cwd.clone(), &filename, &mut ctx)?;
         let stat = node.stat();
+        // debug!("{stat:#?}");
 
         vm.write_with_abi(statbuf, stat, abi)
     })?;
@@ -711,6 +719,7 @@ async fn readv(
 #[syscall(i386 = 146, amd64 = 20)]
 async fn writev(
     abi: Abi,
+    thread: Arc<Thread>,
     #[state] virtual_memory: Arc<VirtualMemory>,
     #[state] fdtable: Arc<FileDescriptorTable>,
     fd: FdNum,
@@ -737,7 +746,7 @@ async fn writev(
         .await?;
 
     let addr = Pointer::parse(iovec.base, abi)?;
-    write(virtual_memory, fdtable, fd, addr, iovec.len).await
+    write(thread, virtual_memory, fdtable, fd, addr, iovec.len).await
 }
 
 #[syscall(i386 = 33, amd64 = 21)]
@@ -1088,7 +1097,7 @@ fn execve(
     let mut argv = argv;
     let mut envp = envp;
 
-    let (pathname, args, envs) = vm_activator.activate(&virtual_memory, |vm| -> Result<_> {
+    let (pathname, args, mut envs) = vm_activator.activate(&virtual_memory, |vm| -> Result<_> {
         let pathname = vm.read(pathname)?;
 
         let mut args = Vec::new();
@@ -1117,6 +1126,8 @@ fn execve(
     })?;
 
     log::info!("execve({pathname:?}, {args:?}, {envs:?})");
+
+    envs.push(CString::new("NIX_DEBUG=7").unwrap());
 
     thread.execve(&pathname, &args, &envs, &mut ctx, vm_activator)?;
 
@@ -1323,6 +1334,24 @@ fn getdents(
     Ok(len)
 }
 
+#[syscall(i386 = 17, amd64 = 79)]
+fn getcwd(
+    thread: &mut ThreadGuard,
+    vm_activator: &mut VirtualMemoryActivator,
+    #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] mut ctx: FileAccessContext,
+    path: Pointer<Path>,
+    size: u64,
+) -> SyscallResult {
+    let cwd = thread.cwd.path(&mut ctx)?;
+    if cwd.as_bytes().len() + 1 > usize::try_from(size)? {
+        return Err(Error::range(()));
+    }
+
+    vm_activator.activate(&virtual_memory, |vm| vm.write(path, cwd))?;
+    Ok(0)
+}
+
 #[syscall(i386 = 12, amd64 = 80)]
 fn chdir(
     thread: &mut ThreadGuard,
@@ -1340,26 +1369,34 @@ fn chdir(
 fn fchdir(
     thread: &mut ThreadGuard,
     #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] mut ctx: FileAccessContext,
     fd: FdNum,
 ) -> SyscallResult {
     let dirfd = fdtable.get(fd)?;
-    thread.cwd = dirfd.as_dir()?;
+    thread.cwd = dirfd.as_dir(&mut ctx)?;
     Ok(0)
 }
 
 #[syscall(i386 = 39, amd64 = 83)]
 fn mkdir(
     thread: &mut ThreadGuard,
-    #[state] virtual_memory: Arc<VirtualMemory>,
-    #[state] mut ctx: FileAccessContext,
     vm_activator: &mut VirtualMemoryActivator,
+    #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] ctx: FileAccessContext,
     pathname: Pointer<Path>,
     mode: u64,
 ) -> SyscallResult {
-    let mode = FileMode::from_bits_truncate(mode);
-    let pathname = vm_activator.activate(&virtual_memory, |vm| vm.read(pathname))?;
-    create_directory(thread.cwd.clone(), &pathname, mode, &mut ctx)?;
-    Ok(0)
+    mkdirat(
+        thread,
+        vm_activator,
+        virtual_memory,
+        fdtable,
+        ctx,
+        FdNum::CWD,
+        pathname,
+        mode,
+    )
 }
 
 #[syscall(i386 = 10, amd64 = 85)]
@@ -1794,25 +1831,55 @@ fn openat(
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(dfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
 
-    let node = if flags.contains(OpenFlags::CREAT) {
-        create_file(
-            start_dir,
-            &filename,
-            FileMode::from_bits_truncate(mode),
-            &mut ctx,
-        )?
-    } else if flags.contains(OpenFlags::NOFOLLOW) {
-        lookup_node(start_dir.clone(), &filename, &mut ctx)?
+    let fd = if flags.contains(OpenFlags::PATH) {
+        let path_fd = PathFd::new(Arc::downgrade(&start_dir), filename);
+        FileDescriptor::from(path_fd)
     } else {
-        lookup_and_resolve_node(start_dir, &filename, &mut ctx)?
+        let node = if flags.contains(OpenFlags::CREAT) {
+            create_file(
+                start_dir,
+                &filename,
+                FileMode::from_bits_truncate(mode),
+                flags.contains(OpenFlags::EXCL),
+                &mut ctx,
+            )?
+        } else if flags.contains(OpenFlags::NOFOLLOW) {
+            lookup_node(start_dir.clone(), &filename, &mut ctx)?
+        } else {
+            lookup_and_resolve_node(start_dir, &filename, &mut ctx)?
+        };
+        node.open(flags)?
     };
 
-    let fd = node.open(flags)?;
     let fd = fdtable.insert(fd)?;
     Ok(fd.get() as u64)
+}
+
+#[syscall(i386 = 296, amd64 = 258)]
+fn mkdirat(
+    thread: &mut ThreadGuard,
+    vm_activator: &mut VirtualMemoryActivator,
+    #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] mut ctx: FileAccessContext,
+    dfd: FdNum,
+    pathname: Pointer<Path>,
+    mode: u64,
+) -> SyscallResult {
+    let start_dir = if dfd == FdNum::CWD {
+        thread.cwd.clone()
+    } else {
+        let fd = fdtable.get(dfd)?;
+        fd.as_dir(&mut ctx)?
+    };
+
+    let mode = FileMode::from_bits_truncate(mode);
+    let pathname = vm_activator.activate(&virtual_memory, |vm| vm.read(pathname))?;
+    create_directory(start_dir, &pathname, mode, &mut ctx)?;
+    Ok(0)
 }
 
 #[syscall(i386 = 299, amd64 = 261)]
@@ -1842,7 +1909,7 @@ fn newfstatat(
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(dfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
 
     vm_activator.activate(&virtual_memory, |vm| {
@@ -1873,7 +1940,7 @@ fn unlinkat(
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(dfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
 
     if flags.contains(UnlinkOptions::REMOVEDIR) {
@@ -1908,13 +1975,13 @@ fn linkat(
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(olddirfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
     let newdir = if newdirfd == FdNum::CWD {
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(newdirfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
 
     hard_link(
@@ -1944,7 +2011,7 @@ fn symlinkat(
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(newdfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
 
     let (oldname, newname) = vm_activator.activate(&virtual_memory, |vm| {
@@ -1973,13 +2040,45 @@ fn fchmodat(
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(dfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
 
     let path = vm_activator.activate(&virtual_memory, |vm| vm.read(filename))?;
 
     set_mode(newdfd, &path, mode, &mut ctx)?;
 
+    Ok(0)
+}
+
+#[syscall(i386 = 307, amd64 = 269)]
+fn faccessat(
+    thread: &mut ThreadGuard,
+    vm_activator: &mut VirtualMemoryActivator,
+    #[state] virtual_memory: Arc<VirtualMemory>,
+    #[state] fdtable: Arc<FileDescriptorTable>,
+    #[state] mut ctx: FileAccessContext,
+    dfd: FdNum,
+    pathname: Pointer<Path>,
+    mode: FileMode,
+    flags: u64,
+) -> SyscallResult {
+    let path = thread.cwd.path(&mut ctx);
+
+    debug!(
+        "{:?}",
+        path.as_ref().map(|a| core::str::from_utf8(a.as_bytes()))
+    );
+
+    Ok(0)
+}
+
+#[syscall(i386 = 320, amd64 = 280)]
+fn utimensat(
+    dirfd: FdNum,
+    pathname: Pointer<Path>,
+    times: Pointer<c_void>,
+    flags: i32,
+) -> SyscallResult {
     Ok(0)
 }
 
@@ -2046,14 +2145,14 @@ fn renameat2(
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(olddfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
 
     let newd = if newdfd == FdNum::CWD {
         thread.cwd.clone()
     } else {
         let fd = fdtable.get(newdfd)?;
-        fd.as_dir()?
+        fd.as_dir(&mut ctx)?
     };
 
     let (oldname, newname) = vm_activator.activate(&virtual_memory, |vm| -> Result<_> {

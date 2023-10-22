@@ -659,12 +659,12 @@ impl InitializedVirtualMemoryState {
         let addr = addr.unwrap_or_else(|| self.find_free_address(len));
         let end = addr + len;
 
-        debug!(
-            "adding mapping {:?}-{:?} {:?}",
-            addr,
-            addr + len,
-            permissions
-        );
+        // debug!(
+        // "adding mapping {:?}-{:?} {:?}",
+        // addr,
+        // addr + len,
+        // permissions
+        // );
 
         self.unmap(addr, len);
 
@@ -805,7 +805,7 @@ impl InitializedVirtualMemoryState {
             return;
         }
 
-        debug!("unmapping {addr:?}-{end:?}");
+        // debug!("unmapping {addr:?}-{end:?}");
 
         let mut i = 0;
         while let Some(mapping) = self.mappings.get_mut(i) {

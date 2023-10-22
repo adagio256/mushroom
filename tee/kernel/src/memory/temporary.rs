@@ -1,8 +1,16 @@
-use core::cell::{RefCell, RefMut};
+use core::{
+    cell::{RefCell, RefMut},
+    panic::Location,
+};
 
 use crate::spin::{lazy::Lazy, mutex::Mutex};
 use constants::virtual_address::TEMPORARY;
-use x86_64::structures::paging::{page::PageRangeInclusive, Page, PhysFrame, Size4KiB};
+use log::debug;
+use x86_64::{
+    instructions::tlb::Invlpgb,
+    registers::control::Cr3,
+    structures::paging::{page::PageRangeInclusive, Page, PhysFrame, Size4KiB},
+};
 
 use crate::{
     error::Result,
@@ -46,20 +54,36 @@ struct TemporaryMapping {
 }
 
 impl TemporaryMapping {
+    #[track_caller]
     pub fn new(frame: PhysFrame) -> Result<Self> {
         static PAGES: Lazy<Mutex<PageRangeInclusive<Size4KiB>>> =
             Lazy::new(|| Mutex::new(TEMPORARY.into_iter()));
 
-        let per_cpu = PerCpu::get()
-            .temporary_mapping
-            .get_or_init(|| RefCell::new(PAGES.lock().next().unwrap()));
+        let per_cpu = PerCpu::get().temporary_mapping.get_or_init(|| {
+            let page = PAGES.lock().next().unwrap();
+            debug!("{page:?}");
+            RefCell::new(page)
+        });
 
         let page = per_cpu.borrow_mut();
         let entry =
             PresentPageTableEntry::new(frame, PageTableFlags::WRITABLE | PageTableFlags::GLOBAL);
+        let prev = PerCpu::get()
+            .temporary_mapping_used
+            .borrow_mut()
+            .replace(Location::caller());
+        if let Some(prev) = prev {
+            panic!("{prev}");
+        }
+
+        flush_current_pcid();
+
+        // debug!("map {page:?}");
         unsafe {
             map_page(*page, entry, &mut (&FRAME_ALLOCATOR))?;
         }
+
+        flush_current_pcid();
 
         Ok(Self { page })
     }
@@ -71,8 +95,25 @@ impl TemporaryMapping {
 
 impl Drop for TemporaryMapping {
     fn drop(&mut self) {
+        flush_current_pcid();
+
+        *PerCpu::get().temporary_mapping_used.borrow_mut() = None;
+        // debug!("unmap {:?}", self.page);
         unsafe {
             unmap_page(*self.page);
         }
+
+        flush_current_pcid();
     }
+}
+
+fn flush_current_pcid() {
+    static INVLPGB: Lazy<Invlpgb> = Lazy::new(|| Invlpgb::new().expect("invlpgb not supported"));
+
+    let (_, pcid) = Cr3::read_pcid();
+    unsafe {
+        INVLPGB.build().pcid(pcid).flush();
+    }
+
+    INVLPGB.tlbsync();
 }

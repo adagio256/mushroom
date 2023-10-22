@@ -1,4 +1,4 @@
-use core::cmp;
+use core::{cmp, f32::consts::E};
 
 use crate::{
     dir_impls,
@@ -16,10 +16,11 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::debug;
 
 use super::{
-    lookup_node_with_parent, new_ino, DirEntry, DirEntryName, DynINode, FileAccessContext,
-    FileSnapshot, INode,
+    create_file, lookup_node_with_parent, new_ino, DirEntry, DirEntryName, DynINode,
+    FileAccessContext, FileSnapshot, INode,
 };
 use crate::{
     error::{Error, Result},
@@ -120,7 +121,13 @@ impl Directory for TmpFsDir {
             .items
             .get(path_segment)
             .cloned()
-            .ok_or(Error::no_ent(()))
+            .ok_or_else(|| {
+                debug!(
+                    "missing {:?}",
+                    core::str::from_utf8(path_segment.as_bytes())
+                );
+                Error::no_ent(())
+            })
     }
 
     fn create_dir(&self, file_name: FileName<'static>, mode: FileMode) -> Result<DynINode> {
@@ -141,6 +148,7 @@ impl Directory for TmpFsDir {
         path_segment: FileName<'static>,
         mode: FileMode,
         create_new: bool,
+        ctx: &mut FileAccessContext,
     ) -> Result<DynINode> {
         let mut guard = self.internal.lock();
         let entry = guard.items.entry(path_segment);
@@ -154,10 +162,16 @@ impl Directory for TmpFsDir {
                 if create_new {
                     return Err(Error::exist(()));
                 }
-                if entry.get().ty() != FileType::File {
+                let entry = entry.get();
+                if entry.ty() == FileType::Link {
+                    let this = self.this.upgrade().unwrap();
+                    let link = entry.read_link()?;
+                    return create_file(this, &link, mode, create_new, ctx);
+                }
+                if entry.ty() != FileType::File {
                     return Err(Error::exist(()));
                 }
-                Ok(entry.get().clone())
+                Ok(entry.clone())
             }
         }
     }
@@ -169,7 +183,7 @@ impl Directory for TmpFsDir {
         create_new: bool,
     ) -> Result<DynINode> {
         let mut guard = self.internal.lock();
-        let entry = guard.items.entry(file_name);
+        let entry = guard.items.entry(file_name.clone());
         match entry {
             Entry::Vacant(entry) => {
                 let link = Arc::new(TmpFsSymlink {
@@ -181,6 +195,7 @@ impl Directory for TmpFsDir {
             }
             Entry::Occupied(mut entry) => {
                 if create_new {
+                    debug!("{:?}", core::str::from_utf8(file_name.as_bytes()).unwrap());
                     return Err(Error::exist(()));
                 }
                 let link = Arc::new(TmpFsSymlink {
