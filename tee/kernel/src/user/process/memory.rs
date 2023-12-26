@@ -1,24 +1,16 @@
 use core::{
-    arch::asm,
-    borrow::Borrow,
-    cmp,
-    intrinsics::volatile_copy_nonoverlapping_memory,
-    iter::Step,
+    arch::asm, borrow::Borrow, cmp, intrinsics::volatile_copy_nonoverlapping_memory, iter::Step,
     ops::Deref,
 };
 
-use crate::spin::{lazy::Lazy, mutex::Mutex};
+use crate::{memory::invlpgb::INVLPGB, spin::mutex::Mutex};
 use alloc::{borrow::Cow, boxed::Box, ffi::CString, sync::Arc, vec::Vec};
 use bitflags::bitflags;
 use crossbeam_queue::SegQueue;
 use log::debug;
 use x86_64::{
     align_down,
-    instructions::{
-        interrupts::without_interrupts,
-        random::RdRand,
-        tlb::{Invlpgb, Pcid},
-    },
+    instructions::{interrupts::without_interrupts, random::RdRand, tlb::Pcid},
     registers::{
         control::{Cr0, Cr0Flags, Cr3},
         rflags::{self, RFlags},
@@ -1329,14 +1321,7 @@ impl PcidAllocations {
     }
 
     unsafe fn deallocate(&mut self, pcid: Pcid) {
-        static INVLPGB: Lazy<Invlpgb> =
-            Lazy::new(|| Invlpgb::new().expect("invlpgb not supported"));
-
-        unsafe {
-            INVLPGB.build().pcid(pcid).flush();
-        }
-
-        INVLPGB.tlbsync();
+        INVLPGB.flush_pcid(pcid);
 
         self.in_use[usize::from(pcid.value())] = false;
     }
