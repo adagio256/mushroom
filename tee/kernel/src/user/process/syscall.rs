@@ -1,14 +1,17 @@
 use core::{
+    arch::x86_64::_rdtsc,
     cmp,
     ffi::{c_void, CStr},
     fmt,
     num::NonZeroU32,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use alloc::{ffi::CString, sync::Arc, vec::Vec};
 use bit_field::BitField;
 use bytemuck::{bytes_of, bytes_of_mut, Zeroable};
 use kernel_macros::syscall;
+use log::debug;
 use x86_64::VirtAddr;
 
 use crate::{
@@ -30,7 +33,10 @@ use crate::{
     time,
     user::process::{
         memory::MemoryPermissions,
-        syscall::args::{LongOffset, UserDesc, UserDescFlags},
+        syscall::{
+            args::{LongOffset, UserDesc, UserDescFlags},
+            traits::ProfilingFuture,
+        },
     },
 };
 
@@ -122,6 +128,7 @@ const SYSCALL_HANDLERS: SyscallHandlers = {
     handlers.register(SysUname);
     handlers.register(SysFcntl);
     handlers.register(SysFcntl64);
+    handlers.register(SysFtruncate);
     handlers.register(SysGetdents);
     handlers.register(SysGetcwd);
     handlers.register(SysChdir);
@@ -188,6 +195,9 @@ async fn read(
     Ok(len)
 }
 
+static FD_GET_COUNTER: AtomicU64 = AtomicU64::new(0);
+static DO_IO_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[syscall(i386 = 4, amd64 = 1)]
 async fn write(
     #[state] virtual_memory: Arc<VirtualMemory>,
@@ -196,14 +206,24 @@ async fn write(
     buf: Pointer<[u8]>,
     count: u64,
 ) -> SyscallResult {
+    let start = unsafe { _rdtsc() };
+
     let fd = fdtable.get(fd)?;
+
+    let end = unsafe { _rdtsc() };
+    FD_GET_COUNTER.fetch_add(end - start, Ordering::Relaxed);
 
     let count = usize::try_from(count)?;
 
-    let len = do_io_with_vm(&*fd.clone(), Events::WRITE, virtual_memory, move |vm| {
-        fd.write_from_user(vm, buf, count)
-    })
-    .await?;
+    let (res, duration) = ProfilingFuture::new(do_io_with_vm(
+        &*fd.clone(),
+        Events::WRITE,
+        virtual_memory,
+        move |vm| fd.write_from_user(vm, buf, count),
+    ))
+    .await;
+    DO_IO_COUNTER.fetch_add(duration, Ordering::Relaxed);
+    let len = res?;
 
     let len = u64::try_from(len)?;
     Ok(len)
@@ -585,7 +605,6 @@ impl Syscall for SysRtSigprocmask {
 
             Ok(0)
         })
-        .await
     }
 
     fn display(
@@ -701,8 +720,7 @@ async fn readv(
                 }
             }
             Ok(Iovec { base: 0, len: 0 })
-        })
-        .await?;
+        })?;
 
     let addr = Pointer::parse(iovec.base, abi)?;
     read(virtual_memory, fdtable, fd, addr, iovec.len).await
@@ -733,8 +751,7 @@ async fn writev(
                 }
             }
             Ok(Iovec { base: 0, len: 0 })
-        })
-        .await?;
+        })?;
 
     let addr = Pointer::parse(iovec.base, abi)?;
     write(virtual_memory, fdtable, fd, addr, iovec.len).await
@@ -922,6 +939,8 @@ fn socketpair(
     Ok(0)
 }
 
+static CLONE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[syscall(i386 = 120, amd64 = 56)]
 async fn clone(
     thread: Arc<Thread>,
@@ -945,11 +964,16 @@ async fn clone(
             Some(Arc::new(Process::new(new_tid)))
         };
 
+        let start = unsafe { _rdtsc() };
+
         let new_virtual_memory = if flags.contains(CloneFlags::VM) {
             None
         } else {
             Some(Arc::new((**thread.virtual_memory()).clone(vm_activator)?))
         };
+
+        let end = unsafe { _rdtsc() };
+        CLONE_COUNTER.fetch_add(end - start, Ordering::Relaxed);
 
         let new_fdtable = if flags.contains(CloneFlags::FILES) {
             // Reuse the same files.
@@ -1005,8 +1029,7 @@ async fn clone(
         })?;
 
         Ok((tid, vfork_receiver))
-    })
-    .await?;
+    })?;
 
     if let Some(vfork_receiver) = vfork_receiver {
         let _ = vfork_receiver.recv().await;
@@ -1054,12 +1077,19 @@ async fn vfork(thread: Arc<Thread>, #[state] fdtable: Arc<FileDescriptorTable>) 
     let mut guard = thread.lock();
     guard.unwaited_children += 1;
 
+    let start = unsafe { _rdtsc() };
+    let mut point2 = 0;
+    let mut point3 = 0;
+    let mut point4 = 0;
+
     let tid = Thread::spawn(|self_weak| {
         let new_tid = new_tid();
         let new_process = Some(Arc::new(Process::new(new_tid)));
+        point2 = unsafe { _rdtsc() };
         let new_fdtable = Arc::new((*fdtable).clone());
+        point3 = unsafe { _rdtsc() };
 
-        Result::Ok(guard.clone(
+        let res = Result::Ok(guard.clone(
             new_tid,
             self_weak,
             new_process,
@@ -1069,11 +1099,25 @@ async fn vfork(thread: Arc<Thread>, #[state] fdtable: Arc<FileDescriptorTable>) 
             None,
             None,
             Some(sender),
-        ))
+        ));
+
+        point4 = unsafe { _rdtsc() };
+
+        res
     })?;
     drop(guard);
 
-    let _ = receiver.recv().await;
+    let end = unsafe { _rdtsc() };
+    // log::error!(
+    // "vfork {} {} {} {}",
+    // point2 - start,
+    // point3 - start,
+    // point4 - start,
+    // end - start
+    // );
+
+    let (_, a) = ProfilingFuture::new(receiver.recv()).await;
+    // log::error!("vfork {a}");
 
     Ok(u64::from(tid))
 }
@@ -1120,9 +1164,17 @@ fn execve(
         Result::Ok((pathname, args, envs))
     })?;
 
-    log::info!("execve({pathname:?}, {args:?}, {envs:?})");
+    // log::info!("execve({pathname:?}, {args:?}, {envs:?})");
+    let mut envs = envs;
+    envs.push(CString::new("NIX_DEBUG=7").unwrap());
+
+    let start = unsafe { _rdtsc() };
 
     thread.execve(&pathname, &args, &envs, &mut ctx, vm_activator)?;
+
+    let end = unsafe { _rdtsc() };
+
+    // debug!("execve inner: {}", end - start);
 
     if let Some(vfork_parent) = thread.vfork_done.take() {
         let _ = vfork_parent.send(());
@@ -1205,8 +1257,7 @@ async fn wait4(
 
         VirtualMemoryActivator::use_from_async(virtual_memory, move |vm| {
             vm.write_bytes(addr, bytes_of(&wstatus))
-        })
-        .await?;
+        })?;
     }
 
     let mut guard = thread.lock();
@@ -1299,6 +1350,13 @@ fn fcntl64(
             Ok(0)
         }
     }
+}
+
+#[syscall(i386 = 93, amd64 = 77)]
+fn ftruncate(#[state] fdtable: Arc<FileDescriptorTable>, fd: FdNum, length: u64) -> SyscallResult {
+    let fd = fdtable.get(fd)?;
+    fd.truncate(length)?;
+    Ok(0)
 }
 
 #[syscall(i386 = 141, amd64 = 78)]
@@ -1622,8 +1680,7 @@ async fn futex(
                 let deadline =
                     VirtualMemoryActivator::use_from_async(virtual_memory.clone(), move |vm| {
                         vm.read_with_abi(utime, abi)
-                    })
-                    .await?;
+                    })?;
                 Some(deadline)
             } else {
                 None
@@ -1764,8 +1821,7 @@ async fn epoll_wait(
 
     let len = events.len();
 
-    VirtualMemoryActivator::use_from_async(virtual_memory, move |vm| vm.write(event, &*events))
-        .await?;
+    VirtualMemoryActivator::use_from_async(virtual_memory, move |vm| vm.write(event, &*events))?;
 
     Ok(len.try_into()?)
 }

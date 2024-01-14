@@ -1,4 +1,4 @@
-use core::{ffi::CStr, iter::from_fn};
+use core::{arch::x86_64::_rdtsc, ffi::CStr, iter::from_fn};
 
 use crate::{
     fs::node::{DynINode, FileAccessContext},
@@ -28,6 +28,8 @@ use crate::{
 
 impl ActiveVirtualMemory<'_, '_> {
     fn load_elf(&mut self, mut base: u64, elf_bytes: FileSnapshot) -> Result<LoadInfo> {
+        let start = unsafe { _rdtsc() };
+
         let elf = Elf::parse(&elf_bytes).unwrap();
         match elf.header.e_type {
             ET_DYN => {}
@@ -35,7 +37,11 @@ impl ActiveVirtualMemory<'_, '_> {
             ty => unimplemented!("unimplemented type: {ty:#x}"),
         }
 
+        let start2 = unsafe { _rdtsc() };
+
         let mut phdr = None;
+
+        let mut mmap_into_time = 0;
 
         for ph in elf.program_headers.iter().filter(|ph| ph.p_type == PT_LOAD) {
             let addr = VirtAddr::new(base + ph.p_vaddr);
@@ -53,7 +59,11 @@ impl ActiveVirtualMemory<'_, '_> {
                 permissions |= MemoryPermissions::READ;
             }
 
+            let start = unsafe { _rdtsc() };
             self.mmap_into(Some(addr), len, offset, elf_bytes.clone(), permissions)?;
+            let end = unsafe { _rdtsc() };
+
+            mmap_into_time += end - start;
 
             let zero_len = ph.p_memsz - ph.p_filesz;
             if zero_len != 0 {
@@ -64,6 +74,14 @@ impl ActiveVirtualMemory<'_, '_> {
                 phdr = Some(base + ph.p_vaddr + (elf.header.e_phoff - ph.p_offset));
             }
         }
+
+        let end = unsafe { _rdtsc() };
+
+        // log::debug!(
+        // "load elf {} {} {mmap_into_time}",
+        // start2 - start,
+        // end - start2
+        // );
 
         Ok(LoadInfo {
             phdr,

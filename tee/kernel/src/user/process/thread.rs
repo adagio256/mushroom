@@ -1,4 +1,5 @@
 use core::{
+    arch::x86_64::_rdtsc,
     ffi::CStr,
     ops::{BitAndAssign, BitOrAssign, Deref, DerefMut, Not},
     sync::atomic::{AtomicU32, Ordering},
@@ -32,7 +33,7 @@ use crate::{
 use super::{
     memory::{VirtualMemory, VirtualMemoryActivator},
     syscall::{
-        args::{FileMode, Pointer},
+        args::{FileMode, Pointer, SigInfo},
         cpu_state::{CpuState, Exit, PageFaultExit},
     },
     Process,
@@ -67,7 +68,9 @@ impl Threads {
     }
 
     pub fn remove(&self, tid: u32) {
-        self.map.lock().remove(&tid);
+        let a = self.map.lock().remove(&tid);
+        let arc = a.unwrap();
+        // log::info!("remove strong count: {}", Arc::strong_count(&arc));
     }
 }
 
@@ -84,7 +87,6 @@ pub struct Thread {
 
     // Mutable state.
     state: Mutex<ThreadState>,
-    // Mutable state specific to the ABI the thread is running with.
     pub cpu_state: Mutex<CpuState>,
 }
 
@@ -208,8 +210,7 @@ impl Thread {
                 let clone = self.clone();
                 let exit = VirtualMemoryActivator::r#do(move |vm_activator| {
                     clone.run_userspace(vm_activator).unwrap()
-                })
-                .await;
+                });
 
                 match exit {
                     Exit::Syscall(args) => self.clone().execute_syscall(args).await,
@@ -230,7 +231,6 @@ impl Thread {
             let mut guard = self.lock();
             guard.exit(vm_activator, status)
         })
-        .await
     }
 
     pub async fn wait_for_exit(&self) -> u8 {
@@ -262,9 +262,25 @@ impl Thread {
         let handled =
             VirtualMemoryActivator::use_from_async(virtual_memory.clone(), move |_| unsafe {
                 virtual_memory.handle_page_fault(page_fault.addr, page_fault.code)
-            })
+            });
+        if handled {
+            return;
+        }
+
+        self.self_weak
+            .upgrade()
+            .unwrap()
+            .clone()
+            .deliver_signal(SigInfo::sig_fault(page_fault.addr))
             .await;
-        assert!(handled);
+    }
+
+    pub async fn deliver_signal(self: Arc<Self>, info: SigInfo) {
+        panic!();
+
+        VirtualMemoryActivator::r#do(move |vm_activator| {
+            self.lock().exit(vm_activator, 128 + (info.signo as u8))
+        })
     }
 }
 
@@ -366,13 +382,21 @@ impl ThreadGuard<'_> {
         ctx: &mut FileAccessContext,
         vm_activator: &mut VirtualMemoryActivator,
     ) -> Result<()> {
+        let start1 = unsafe { _rdtsc() };
+
         let node = lookup_and_resolve_node(self.cwd.clone(), path, ctx)?;
         if !node.mode().contains(FileMode::EXECUTE) {
             return Err(Error::acces(()));
         }
         let bytes = node.read_snapshot()?;
 
-        self.start_executable(bytes, argv, envp, ctx, vm_activator)
+        let start = unsafe { _rdtsc() };
+        let res = self.start_executable(bytes, argv, envp, ctx, vm_activator);
+        let end = unsafe { _rdtsc() };
+
+        // log::debug!("inner inner execve {} {}", end - start1, end - start);
+
+        res
     }
 
     pub fn start_executable(

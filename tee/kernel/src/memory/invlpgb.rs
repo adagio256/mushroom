@@ -25,7 +25,6 @@ impl InvlpgbCompat {
 
     pub fn flush_pcid(&self, pcid: Pcid) {
         if let Some(invlpgb) = self.invlpgb.as_ref() {
-            let (_, pcid) = Cr3::read_pcid();
             unsafe {
                 invlpgb.build().pcid(pcid).flush();
             }

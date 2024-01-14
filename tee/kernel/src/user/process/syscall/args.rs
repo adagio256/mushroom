@@ -6,7 +6,7 @@ use core::{
 use alloc::sync::Arc;
 use bit_field::BitField;
 use bitflags::bitflags;
-use bytemuck::{checked, CheckedBitPattern, NoUninit, Pod, Zeroable};
+use bytemuck::{bytes_of, checked, CheckedBitPattern, NoUninit, Pod, Zeroable};
 use x86_64::VirtAddr;
 
 use crate::{
@@ -180,7 +180,10 @@ where
     _marker: PhantomData<T>,
 }
 
-impl<T> Pointer<T> {
+impl<T> Pointer<T>
+where
+    T: ?Sized,
+{
     pub const NULL: Self = Self::new(0);
 
     pub const fn new(addr: u64) -> Self {
@@ -912,4 +915,40 @@ bitflags! {
         const AT_SYMLINK_NOFOLLOW = 0x100;
         const AT_EMPTY_PATH = 0x1000;
     }
+}
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct SigInfo {
+    pub signo: i32,
+    pub code: i32,
+    pub errno: i32,
+    pub fields: [u8; 128 - 12],
+}
+
+impl SigInfo {
+    pub fn sig_fault(addr: u64) -> Self {
+        Self::new(14, SigFault { addr })
+    }
+
+    fn new<T>(signo: i32, fields: T) -> Self
+    where
+        T: NoUninit,
+    {
+        let mut this = Self {
+            signo,
+            code: 0,
+            errno: 0,
+            fields: [0; 128 - 12],
+        };
+        let fields = bytes_of(&fields);
+        this.fields[..fields.len()].copy_from_slice(fields);
+        this
+    }
+}
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct SigFault {
+    pub addr: u64,
 }

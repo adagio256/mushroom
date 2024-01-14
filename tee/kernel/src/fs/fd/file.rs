@@ -81,12 +81,12 @@ pub trait File: INode {
 
         self.append(buf)
     }
-    fn truncate(&self) -> Result<()>;
+    fn truncate(&self, length: u64) -> Result<()>;
 }
 
 pub fn open_file(file: Arc<dyn File>, flags: OpenFlags) -> Result<FileDescriptor> {
     if flags.contains(OpenFlags::TRUNC) {
-        file.truncate()?;
+        file.truncate(0)?;
     }
 
     let fd = if flags.contains(OpenFlags::WRONLY) {
@@ -234,6 +234,10 @@ impl OpenFileDescription for WriteonlyFileFileDescription {
         self.file.write(pos, buf)
     }
 
+    fn truncate(&self, length: u64) -> Result<()> {
+        self.file.truncate(length)
+    }
+
     fn seek(&self, offset: usize, whence: Whence) -> Result<usize> {
         let mut guard = self.cursor_idx.lock();
         match whence {
@@ -336,12 +340,28 @@ impl OpenFileDescription for ReadWriteFileFileDescription {
         Ok(len)
     }
 
+    fn write_from_user(
+        &self,
+        vm: &mut ActiveVirtualMemory,
+        pointer: Pointer<[u8]>,
+        len: usize,
+    ) -> Result<usize> {
+        let mut guard = self.cursor_idx.lock();
+        let len = self.file.write_from_user(*guard, vm, pointer, len)?;
+        *guard += len;
+        Ok(len)
+    }
+
     fn pread(&self, pos: usize, buf: &mut [u8]) -> Result<usize> {
         self.file.read(pos, buf)
     }
 
     fn pwrite(&self, pos: usize, buf: &[u8]) -> Result<usize> {
         self.file.write(pos, buf)
+    }
+
+    fn truncate(&self, length: u64) -> Result<()> {
+        self.file.truncate(length)
     }
 
     fn seek(&self, offset: usize, whence: Whence) -> Result<usize> {

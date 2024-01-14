@@ -2,21 +2,28 @@
 
 use std::{
     collections::{hash_map::Entry, HashMap},
+    io::{stdin, Read, Seek},
     mem::size_of,
+    os::fd::{AsFd, AsRawFd},
     ptr::NonNull,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bit_field::BitField;
-use bytemuck::NoUninit;
+use bytemuck::{bytes_of_mut, pod_read_unaligned, NoUninit};
 use constants::{
     physical_address::DYNAMIC, FINISH_OUTPUT_MSR, FIRST_AP, KICK_AP_PORT, LOG_PORT, MAX_APS_COUNT,
     MEMORY_PORT, UPDATE_OUTPUT_MSR,
 };
 use kvm::{KvmHandle, Page, VcpuHandle};
+use loader::LoadCommand;
+use nix::{
+    sys::signal::{kill, signal, Signal},
+    unistd::gettid,
+};
 use snp_types::{
     ghcb::{
         self,
@@ -24,7 +31,8 @@ use snp_types::{
         Ghcb, PageSize, PageStateChangeEntry, PageStateChangeHeader,
     },
     guest_policy::GuestPolicy,
-    PageType,
+    vmsa::{Vmsa, VmsaTweakBitmap},
+    PageType, VmplPermissions,
 };
 use tracing::{debug, info};
 use volatile::{
@@ -33,7 +41,7 @@ use volatile::{
 };
 use x86_64::{
     structures::paging::{PageSize as _, PhysFrame, Size2MiB, Size4KiB},
-    PhysAddr,
+    PhysAddr, VirtAddr,
 };
 
 use crate::{
@@ -444,7 +452,11 @@ impl VmContext {
                 }
             }
 
-            let run_res = self.bsp.run();
+            let run_res = self.bsp.run().context("failed to run BSP");
+
+            // let vmsa = self.vm.sev_snp_dbg_decrypt_vmsa(0)?;
+            // let vmsa: Vmsa = pod_read_unaligned(&vmsa);
+            // println!("{:x?}", vmsa.debug(&VmsaTweakBitmap::ZERO));
 
             run_res?;
         }
@@ -452,12 +464,101 @@ impl VmContext {
 
     fn run_ap(id: u8, vm: Arc<VmHandle>) -> JoinHandle<()> {
         std::thread::spawn(move || {
+            unsafe {
+                extern "C" fn handler(_: i32) {
+                    // dbg!("a");
+                }
+
+                signal(
+                    Signal::SIGUSR1,
+                    nix::sys::signal::SigHandler::Handler(handler),
+                )
+                .unwrap();
+            }
+
             let ap = vm.create_vcpu(i32::from(id)).unwrap();
             let kvm_run = ap.get_kvm_run_block().unwrap();
 
             loop {
                 // Run the AP.
                 let res = ap.run();
+
+                if res.is_err() {
+                    let mut code = [0u8; 32];
+                    let _ =
+                        vm.debug_read_va(u32::from(id), VirtAddr::new(0x4000002c39d6), &mut code);
+                    eprintln!("0x4000002c39d6: {code:02x?}");
+
+                    let vmsa = vm.sev_snp_dbg_decrypt_vmsa(u32::from(id)).unwrap();
+                    let vmsa: Vmsa = pod_read_unaligned(&vmsa);
+                    let tweak_bitmap = &VmsaTweakBitmap::ZERO;
+                    eprintln!("{:#x?}", vmsa.debug(tweak_bitmap));
+                    dbg!(id);
+
+                    let mut code = [0u8; 16];
+                    let _ = vm.debug_read_va(
+                        u32::from(id),
+                        VirtAddr::new(vmsa.rip(tweak_bitmap)),
+                        &mut code,
+                    );
+                    eprintln!("code: {code:02x?}");
+
+                    let mut stack = [0u8; 0x28];
+                    let _ = vm.debug_read_va(
+                        u32::from(id),
+                        VirtAddr::new(vmsa.rsp(tweak_bitmap)),
+                        &mut stack,
+                    );
+                    eprintln!("stack: {stack:02x?}");
+
+                    let mut frame_pointer = vmsa.rbp(tweak_bitmap);
+
+                    eprintln!();
+
+                    let mut counter = 10u8;
+
+                    while frame_pointer != 0 {
+                        let Some(next_counter) = counter.checked_sub(1) else {
+                            break;
+                        };
+                        counter = next_counter;
+
+                        eprint!("frame: {frame_pointer:016x}, ");
+
+                        let mut rip = 0u64;
+                        let Ok(()) = vm.debug_read_va(
+                            u32::from(id),
+                            VirtAddr::new(frame_pointer + 8),
+                            bytes_of_mut(&mut rip),
+                        ) else {
+                            eprintln!();
+                            break;
+                        };
+
+                        eprintln!("rip: {rip:016x}");
+
+                        let mut rip = 0u64;
+                        let Ok(()) = vm.debug_read_va(
+                            u32::from(id),
+                            VirtAddr::new(frame_pointer + 24),
+                            bytes_of_mut(&mut rip),
+                        ) else {
+                            eprintln!();
+                            break;
+                        };
+
+                        eprintln!("rip2: {rip:016x}");
+
+                        vm.debug_read_va(
+                            u32::from(id),
+                            VirtAddr::new(frame_pointer),
+                            bytes_of_mut(&mut frame_pointer),
+                        )
+                        .unwrap();
+                    }
+
+                    eprintln!();
+                }
 
                 res.unwrap();
 
@@ -471,7 +572,83 @@ impl VmContext {
                         // Wait for the BSP to wake the AP back up.
                         std::thread::park();
                     }
+                    KvmExit::Interrupted => {
+                        static LOCK: Mutex<()> = Mutex::new(());
+                        let _guard = LOCK.lock();
+
+                        let vmsa = vm.sev_snp_dbg_decrypt_vmsa(u32::from(id)).unwrap();
+                        let vmsa: Vmsa = pod_read_unaligned(&vmsa);
+
+                        let tweak_bitmap = &VmsaTweakBitmap::ZERO;
+
+                        let debug = vmsa.debug(tweak_bitmap);
+                        // eprintln!("{debug:#x?}");
+
+                        let mut frame_pointer = vmsa.rbp(tweak_bitmap);
+
+                        eprintln!();
+                        eprintln!("{id}:");
+                        eprintln!("rip: {:016x}", vmsa.rip(tweak_bitmap));
+
+                        let mut buffer = [0u8; 32];
+                        vm.debug_read_va(
+                            u32::from(id),
+                            VirtAddr::new(vmsa.rip(tweak_bitmap) - 16),
+                            bytes_of_mut(&mut buffer),
+                        )
+                        .unwrap();
+                        eprintln!("{buffer:02x?}");
+
+                        let mut counter = 10u32;
+
+                        while frame_pointer != 0
+                            && frame_pointer.checked_add(8).is_some()
+                            && VirtAddr::try_new(frame_pointer + 8).is_ok()
+                        {
+                            eprint!("frame: {frame_pointer:016x}, ");
+
+                            let mut rip = 0u64;
+                            let Ok(()) = vm.debug_read_va(
+                                u32::from(id),
+                                VirtAddr::new(frame_pointer + 8),
+                                bytes_of_mut(&mut rip),
+                            ) else {
+                                eprintln!();
+                                break;
+                            };
+
+                            eprintln!("rip: {rip:016x}");
+
+                            vm.debug_read_va(
+                                u32::from(id),
+                                VirtAddr::new(frame_pointer),
+                                bytes_of_mut(&mut frame_pointer),
+                            )
+                            .unwrap();
+
+                            let Some(next_counter) = counter.checked_sub(1) else {
+                                break;
+                            };
+                            counter = next_counter;
+                        }
+
+                        eprintln!();
+                    }
                     exit => {
+                        let vmsa = vm.sev_snp_dbg_decrypt_vmsa(u32::from(id)).unwrap();
+                        let vmsa: Vmsa = pod_read_unaligned(&vmsa);
+                        let tweak_bitmap = &VmsaTweakBitmap::ZERO;
+                        eprintln!("{:#x?}", vmsa.debug(tweak_bitmap));
+                        dbg!(id);
+
+                        let mut code = [0u8; 32];
+                        let _ = vm.debug_read_va(
+                            u32::from(id),
+                            VirtAddr::new(vmsa.rip(tweak_bitmap) - 16),
+                            &mut code,
+                        );
+                        eprintln!("code: {code:02x?}");
+
                         panic!("unexpected exit {exit:?}");
                     }
                 }

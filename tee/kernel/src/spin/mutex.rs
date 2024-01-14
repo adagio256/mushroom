@@ -54,6 +54,7 @@ impl<T> Mutex<T> {
             counter += 1;
             if counter.0 == 0 {
                 warn!("lock stalling at {}", Location::caller());
+                panic!();
             }
         }
     }

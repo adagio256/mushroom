@@ -2,6 +2,7 @@
 
 use std::{
     array::from_fn,
+    cmp,
     fs::OpenOptions,
     mem::{size_of, size_of_val},
     num::{NonZeroU8, NonZeroUsize},
@@ -15,7 +16,7 @@ use std::{
 use anyhow::{anyhow, ensure, Context, Result};
 use bit_field::BitField;
 use bitflags::bitflags;
-use bytemuck::{bytes_of, pod_read_unaligned, Contiguous, Pod, Zeroable};
+use bytemuck::{bytes_of, bytes_of_mut, pod_read_unaligned, Contiguous, Pod, Zeroable};
 use nix::{
     errno::Errno,
     ioctl_none, ioctl_read, ioctl_readwrite, ioctl_write_int_bad, ioctl_write_ptr,
@@ -23,9 +24,17 @@ use nix::{
     request_code_none,
     sys::mman::{MapFlags, ProtFlags},
 };
-use snp_types::{guest_policy::GuestPolicy, PageType, VmplPermissions};
+use snp_types::{
+    guest_policy::GuestPolicy,
+    vmsa::{Vmsa, VmsaTweakBitmap},
+    PageType, VmplPermissions,
+};
 use tracing::debug;
 use volatile::VolatilePtr;
+use x86_64::{
+    structures::paging::{PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
+};
 
 use crate::{kvm::hidden::KvmCpuid2, slot::Slot};
 
@@ -557,6 +566,84 @@ impl VmHandle {
         let res = unsafe { self.memory_encrypt_op(payload, None) };
         res.context("failed to debug decrypt vmsa")?;
         Ok(page)
+    }
+
+    pub fn debug_read_pa(&self, mut pa: PhysAddr, mut buf: &mut [u8]) -> Result<()> {
+        while !buf.is_empty() {
+            let gfn = PhysFrame::<Size4KiB>::containing_address(pa);
+            let frame = self.sev_snp_dbg_decrypt(gfn.start_address().as_u64() >> 12)?;
+
+            let start_offset = (pa - gfn.start_address()) as usize;
+            let src = &frame[start_offset..];
+
+            let copy_len = cmp::min(buf.len(), src.len());
+            buf[..copy_len].copy_from_slice(&src[..copy_len]);
+
+            pa += copy_len;
+            buf = &mut buf[copy_len..];
+        }
+
+        Ok(())
+    }
+
+    pub fn debug_read_page(
+        &self,
+        vcpu_id: u32,
+        va: x86_64::structures::paging::Page,
+    ) -> Result<[u8; 4096]> {
+        let vmsa = self.sev_snp_dbg_decrypt_vmsa(vcpu_id)?;
+        let vmsa: Vmsa = pod_read_unaligned(&vmsa);
+        let cr3 = PhysAddr::new_truncate(vmsa.cr3(&VmsaTweakBitmap::ZERO) & !0xfff);
+
+        let pml4e_addr = cr3 + u64::from(va.p4_index()) * 8;
+        let mut pml4e = 0u64;
+        self.debug_read_pa(pml4e_addr, bytes_of_mut(&mut pml4e))?;
+        ensure!(pml4e.get_bit(0), "level 4 entry missing");
+        let addr = PhysAddr::new_truncate(pml4e & !0xfff);
+
+        let pdpe_addr = addr + u64::from(va.p3_index()) * 8;
+        let mut pdpe = 0u64;
+        self.debug_read_pa(pdpe_addr, bytes_of_mut(&mut pdpe))?;
+        ensure!(pdpe.get_bit(0), "level 3 entry missing");
+        let addr = PhysAddr::new_truncate(pdpe & !0xfff);
+
+        let pde_addr = addr + u64::from(va.p2_index()) * 8;
+        let mut pde = 0u64;
+        self.debug_read_pa(pde_addr, bytes_of_mut(&mut pde))?;
+        ensure!(pde.get_bit(0), "level 2 entry missing");
+        let addr = PhysAddr::new_truncate(pde & !0xfff);
+
+        // Check for huge page.
+        if pde.get_bit(7) {
+            return self
+                .sev_snp_dbg_decrypt((addr + 4096 * u64::from(va.p1_index())).as_u64() >> 12);
+        }
+
+        let pte_addr = addr + u64::from(va.p1_index()) * 8;
+        let mut pte = 0u64;
+        self.debug_read_pa(pte_addr, bytes_of_mut(&mut pte))?;
+        ensure!(pte.get_bit(0), "level 1 entry missing");
+        let addr = PhysAddr::new_truncate(pte & !0xfff);
+
+        self.sev_snp_dbg_decrypt(addr.as_u64() >> 12)
+    }
+
+    pub fn debug_read_va(&self, vcpu_id: u32, mut va: VirtAddr, mut buf: &mut [u8]) -> Result<()> {
+        while !buf.is_empty() {
+            let pg = x86_64::structures::paging::Page::containing_address(va);
+            let page = self.debug_read_page(vcpu_id, pg)?;
+
+            let start_offset = usize::from(va.page_offset());
+            let src = &page[start_offset..];
+
+            let copy_len = cmp::min(buf.len(), src.len());
+            buf[..copy_len].copy_from_slice(&src[..copy_len]);
+
+            va += copy_len;
+            buf = &mut buf[copy_len..];
+        }
+
+        Ok(())
     }
 
     pub fn register_encrypted_region(&self, addr: u64, size: u64) -> Result<()> {

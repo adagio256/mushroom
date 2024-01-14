@@ -98,11 +98,13 @@ fn expand_syscall(attr: SyscallAttr, mut input: ItemFn) -> Result<impl Into<Toke
         }
     } else {
         quote! {
-            VirtualMemoryActivator::r#do(move |vm_activator| {
-                let mut thread = thread.lock();
-                let thread = &mut thread;
-                #syscall_ident(#(#function_invocation_args),*)
-            })
+            async move{
+                VirtualMemoryActivator::r#do(move |vm_activator| {
+                    let mut thread = thread.lock();
+                    let thread = &mut thread;
+                    #syscall_ident(#(#function_invocation_args),*)
+                })
+            }
         }
     };
 

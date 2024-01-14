@@ -1,13 +1,29 @@
 use core::{
-    arch::asm, borrow::Borrow, cmp, intrinsics::volatile_copy_nonoverlapping_memory, iter::Step,
+    arch::{
+        asm,
+        x86_64::{
+            _mm256_load_pd, _mm256_load_si256, _mm256_loadu_si256, _mm256_stream_si256, _mm_sfence,
+            _rdtsc,
+        },
+    },
+    borrow::Borrow,
+    cmp,
+    intrinsics::volatile_copy_nonoverlapping_memory,
+    iter::Step,
     ops::Deref,
+    sync::atomic::AtomicU64,
 };
 
-use crate::{memory::invlpgb::INVLPGB, spin::mutex::Mutex};
+use crate::{
+    memory::invlpgb::INVLPGB,
+    rt::spawn,
+    spin::{lazy::Lazy, mutex::Mutex},
+};
 use alloc::{borrow::Cow, boxed::Box, ffi::CString, sync::Arc, vec::Vec};
+use arrayvec::ArrayVec;
 use bitflags::bitflags;
 use crossbeam_queue::SegQueue;
-use log::debug;
+use log::{debug, info};
 use x86_64::{
     align_down,
     instructions::{interrupts::without_interrupts, random::RdRand, tlb::Pcid},
@@ -17,7 +33,9 @@ use x86_64::{
     },
     structures::{
         idt::PageFaultErrorCode,
-        paging::{FrameAllocator, FrameDeallocator, Page, PhysFrame, Size4KiB},
+        paging::{
+            page_table::PageTableEntry, FrameAllocator, FrameDeallocator, Page, PhysFrame, Size4KiB,
+        },
     },
     VirtAddr,
 };
@@ -59,29 +77,35 @@ pub fn do_virtual_memory_op(virtual_memory_activator: &mut VirtualMemoryActivato
 pub struct VirtualMemoryActivator(());
 
 impl VirtualMemoryActivator {
-    pub async fn r#do<R>(f: impl FnOnce(&mut VirtualMemoryActivator) -> R + Send + 'static) -> R
+    pub fn r#do<R>(f: impl FnOnce(&mut VirtualMemoryActivator) -> R + Send + 'static) -> R
     where
         R: Send + 'static,
     {
-        let (sender, receiver) = oneshot::new();
+        let mut vm_activator = VirtualMemoryActivator(());
+        return f(&mut vm_activator);
 
-        PENDING_VIRTUAL_MEMORY_OPERATIONS.push(Box::new(|virtual_memory_activator| {
-            let result = f(virtual_memory_activator);
-            let _ = sender.send(result);
-        }));
-
-        receiver.recv().await.unwrap()
+        // let (sender, receiver) = oneshot::new();
+        //
+        // PENDING_VIRTUAL_MEMORY_OPERATIONS.push(Box::new(|virtual_memory_activator| {
+        // let result = f(virtual_memory_activator);
+        // let _ = sender.send(result);
+        // }));
+        //
+        // receiver.recv().await.unwrap()
     }
 
     /// A function that allows an async function to activate a virtual memory.
-    pub async fn use_from_async<R>(
+    pub fn use_from_async<R>(
         virtual_memory: Arc<VirtualMemory>,
         f: impl FnOnce(&mut ActiveVirtualMemory) -> R + Send + 'static,
     ) -> R
     where
         R: Send + 'static,
     {
-        Self::r#do(move |vm_activator| vm_activator.activate(&virtual_memory, f)).await
+        let mut vm_activator = VirtualMemoryActivator(());
+        return vm_activator.activate(&virtual_memory, f);
+
+        // Self::r#do(move |vm_activator| vm_activator.activate(&virtual_memory, f)).await
     }
 
     pub unsafe fn new() -> Self {
@@ -192,6 +216,26 @@ impl Default for VirtualMemory {
     }
 }
 
+impl Drop for VirtualMemory {
+    fn drop(&mut self) {
+        let state = self.state.get_mut();
+        if let VirtualMemoryState::Initialized(s) = state {
+            if !s.mappings.is_empty() {
+                let this = core::mem::take(self);
+                spawn(async move {
+                    VirtualMemoryActivator::use_from_async(Arc::new(this), |a| {
+                        a.unmap(VirtAddr::new(0), !0)
+                    });
+                });
+            }
+        }
+    }
+}
+
+pub static FORCE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub static FORCE_WRITE_COUNTER2: AtomicU64 = AtomicU64::new(0);
+pub static FORCE_WRITE_COUNTER3: AtomicU64 = AtomicU64::new(0);
+
 pub struct ActiveVirtualMemory<'a, 'b> {
     activator: &'a mut VirtualMemoryActivator,
     virtual_memory: &'b VirtualMemory,
@@ -208,6 +252,22 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
 
     pub fn read_bytes(&self, addr: VirtAddr, bytes: &mut [u8]) -> Result<()> {
         if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let len = without_smap(|| {
+            let len: usize;
+            unsafe {
+                asm!(
+                    "rep movsb",
+                    inout("rsi") addr.as_u64() => _,
+                    inout("rdi") bytes.as_ptr() => _,
+                    inout("rcx") bytes.len() => len,
+                );
+            }
+            len
+        });
+        if len == 0 {
             return Ok(());
         }
 
@@ -299,6 +359,22 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
             return Ok(());
         }
 
+        let len = without_smap(|| {
+            let len: usize;
+            unsafe {
+                asm!(
+                    "rep movsb",
+                    inout("rsi") bytes.as_ptr() => _,
+                    inout("rdi") addr.as_u64() => _,
+                    inout("rcx") bytes.len() => len,
+                );
+            }
+            len
+        });
+        if len == 0 {
+            return Ok(());
+        }
+
         let state = self.state.lock();
         let state = state.initialized();
 
@@ -358,35 +434,30 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
     }
 
     pub fn force_write(&self, page: Page, bytes: &[u8; 0x1000]) -> Result<()> {
-        let mut state = self.state.lock();
-        let state = state.initialized_mut();
+        let frame = (&FRAME_ALLOCATOR)
+            .allocate_frame()
+            .ok_or(Error::no_mem(()))?;
 
-        let mapping = state
-            .mappings
-            .iter_mut()
-            .find(|mapping| mapping.contains_page(page))
-            .ok_or(Error::fault(()))?;
+        let flags = PageTableFlags::USER | PageTableFlags::WRITABLE | PageTableFlags::DIRTY;
+        let entry = PresentPageTableEntry::new(frame, flags);
 
-        let writeable = mapping.permissions.contains(MemoryPermissions::WRITE);
-        if !writeable {
-            mapping.permissions |= MemoryPermissions::WRITE;
+        unsafe {
+            copy_into_frame(frame, bytes)?;
         }
 
-        let ptr = unsafe { mapping.make_writable(page)? };
-
-        without_smap(|| unsafe {
-            let dst = ptr.cast::<u8>();
-            let src = bytes.as_ptr();
-            core::intrinsics::volatile_copy_nonoverlapping_memory(dst, src, bytes.len());
-        });
-
-        if !writeable {
-            mapping.permissions.remove(MemoryPermissions::WRITE);
-            unsafe {
-                remove_flags(page, PageTableFlags::WRITABLE);
-            }
+        unsafe {
+            map_page(page, entry, &mut &FRAME_ALLOCATOR)?;
         }
 
+        Ok(())
+    }
+
+    pub fn force_write2(&self, page: Page, frame: PhysFrame) -> Result<()> {
+        let flags = PageTableFlags::USER | PageTableFlags::DIRTY;
+        let entry = PresentPageTableEntry::new(frame, flags);
+        unsafe {
+            map_page(page, entry, &mut &FRAME_ALLOCATOR)?;
+        }
         Ok(())
     }
 
@@ -533,14 +604,40 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
         &mut self,
         mut f: impl FnMut(Page, &[u8; 0x1000], &mut VirtualMemoryActivator) -> Result<()>,
     ) -> Result<()> {
-        unsafe {
+        let mut counter = 0;
+        let start = unsafe { _rdtsc() };
+        let mut dur = 0;
+        let mut dur2 = 0;
+
+        let res = unsafe {
             find_dirty_userspace_pages(|page| {
+                counter += 1;
+
                 let bytes = &mut [0; 0x1000];
                 let addr = page.start_address();
+                let start = unsafe { _rdtsc() };
                 self.read_bytes(addr, bytes)?;
-                f(page, bytes, self.vm_activator())
+                let end = unsafe { _rdtsc() };
+                dur += end - start;
+
+                let start = unsafe { _rdtsc() };
+                let res = f(page, bytes, self.vm_activator());
+                let end = unsafe { _rdtsc() };
+                dur2 += end - start;
+                res
             })
-        }
+        };
+        let end = unsafe { _rdtsc() };
+
+        let dur = dur / counter;
+        let dur2 = dur2 / counter;
+
+        // info!(
+        // "counter {counter} time={} dur={dur} dur2={dur2}",
+        // end - start
+        // );
+
+        res
     }
 
     pub fn brk_end(&mut self) -> Result<VirtAddr> {
@@ -645,19 +742,30 @@ impl InitializedVirtualMemoryState {
     ) -> Result<VirtAddr> {
         assert!(len < (1 << 47), "mapping of size {len:#x} can never exist");
 
+        let point1 = unsafe { _rdtsc() };
+
         let addr = addr.unwrap_or_else(|| self.find_free_address(len));
         let end = addr + len;
 
-        debug!(
-            "adding mapping {:?}-{:?} {:?}",
-            addr,
-            addr + len,
-            permissions
-        );
+        let point2 = unsafe { _rdtsc() };
+
+        // debug!(
+        // "adding mapping {:?}-{:?} {:?}",
+        // addr,
+        // addr + len,
+        // permissions
+        // );
 
         self.unmap(addr, len);
 
+        let point3 = unsafe { _rdtsc() };
+
         // If the mapping isn't page aligned, immediately map pages for the unaligned start and end.
+        // log::debug!(
+        // "add mapping {} {} {len}",
+        // addr.is_aligned(0x1000u64),
+        // end.is_aligned(0x1000u64),
+        // );
         match (addr.is_aligned(0x1000u64), end.is_aligned(0x1000u64)) {
             (false, false) => {
                 let start_page: Page = Page::containing_address(addr);
@@ -695,6 +803,8 @@ impl InitializedVirtualMemoryState {
             (true, true) => {}
         }
 
+        let point4 = unsafe { _rdtsc() };
+
         let start_page = Page::containing_address(addr.align_up(0x1000u64));
         let end_page = Page::containing_address(end);
         if end_page > start_page {
@@ -715,6 +825,16 @@ impl InitializedVirtualMemoryState {
 
             self.mappings.push(mapping);
         }
+
+        let point5 = unsafe { _rdtsc() };
+
+        // log::debug!(
+        // "{} {} {} {}",
+        // point2 - point1,
+        // point3 - point2,
+        // point4 - point3,
+        // point5 - point4
+        // );
 
         Ok(addr)
     }
@@ -794,7 +914,7 @@ impl InitializedVirtualMemoryState {
             return;
         }
 
-        debug!("unmapping {addr:?}-{end:?}");
+        // debug!("unmapping {addr:?}-{end:?}");
 
         let mut i = 0;
         while let Some(mapping) = self.mappings.get_mut(i) {
@@ -806,8 +926,11 @@ impl InitializedVirtualMemoryState {
             if mapping.start >= start && mapping.start + mapping.num_pages <= end {
                 for page in mapping.start..mapping.end() {
                     if entry_for_page(page).is_some() {
-                        unsafe {
-                            unmap_page(page);
+                        let entry = unsafe { unmap_page(page) };
+                        if !entry.cow() {
+                            unsafe {
+                                (&FRAME_ALLOCATOR).deallocate_frame(entry.frame());
+                            }
                         }
                     }
                 }
@@ -978,34 +1101,63 @@ impl Mapping {
     unsafe fn remove_cow(&self, page: Page) -> Result<*mut [u8; 4096]> {
         let ptr = page.start_address().as_mut_ptr::<[u8; 0x1000]>();
 
+        let point1 = unsafe { _rdtsc() };
+
         unsafe {
             self.make_readable(page)?;
         }
 
+        let point2 = unsafe { _rdtsc() };
+
+        // log::info!("counter remove all {:?}", [point2,].map(|a| { a - point1 }));
+
         let mut current_entry = entry_for_page(page).ok_or(Error::fault(()))?;
         loop {
+            let point1 = unsafe { _rdtsc() };
+
             if !current_entry.cow() {
+                let point2 = unsafe { _rdtsc() };
+                if point2 - point1 > 10000 {
+                    // log::info!("counter remove all {:?}", [point2,].map(|a| { a - point1 }));
+                }
+
                 return Ok(ptr);
             }
 
             if current_entry.writable() {
                 todo!();
             }
+
+            let point2 = unsafe { _rdtsc() };
             let mut content = [0; 0x1000];
             without_smap(|| unsafe {
                 core::intrinsics::volatile_copy_nonoverlapping_memory(&mut content, ptr, 1);
             });
 
+            let point3 = unsafe { _rdtsc() };
+
             let frame = (&FRAME_ALLOCATOR).allocate_frame().unwrap();
+            let point4 = unsafe { _rdtsc() };
             unsafe {
-                copy_into_frame(frame, &content)?;
+                // copy_into_frame(frame, &content)?;
             }
 
-            let new_entry =
-                PresentPageTableEntry::new(frame, current_entry.flags() & !PageTableFlags::COW);
+            unsafe {
+                copy_into_frame(frame, &content);
+            }
+
+            let point5 = unsafe { _rdtsc() };
+
+            let mut new_flags = current_entry.flags() & !PageTableFlags::COW;
+            if self.permissions.contains(MemoryPermissions::WRITE) {
+                new_flags.insert(PageTableFlags::WRITABLE);
+            }
+            let new_entry = PresentPageTableEntry::new(frame, new_flags);
 
             match unsafe { remap_page(page, current_entry, new_entry) } {
-                Ok(_) => return Ok(ptr),
+                Ok(_) => {
+                    return Ok(ptr);
+                }
                 Err(new_entry) => {
                     current_entry = new_entry;
                     unsafe {
@@ -1022,17 +1174,31 @@ impl Mapping {
     unsafe fn make_writable(&self, page: Page) -> Result<*mut [u8; 4096]> {
         if !self.permissions.contains(MemoryPermissions::WRITE) {
             // FIXME: Or ACCESS?
-            return Err(Error::fault(()));
+            // return Err(Error::fault(()));
         }
+
+        let point1 = unsafe { _rdtsc() };
 
         let ptr = unsafe { self.remove_cow(page)? };
 
+        let point2 = unsafe { _rdtsc() };
+
         let entry = entry_for_page(page).unwrap();
+
+        let point3 = unsafe { _rdtsc() };
+
         if !entry.writable() {
             unsafe {
                 add_flags(page, PageTableFlags::WRITABLE | PageTableFlags::USER);
             }
         }
+
+        let point4 = unsafe { _rdtsc() };
+
+        // log::info!(
+        // "counter remove all {:?}",
+        // [point2, point3, point4].map(|a| { a - point1 }),
+        // );
 
         Ok(ptr)
     }
@@ -1118,17 +1284,22 @@ impl Mapping {
                     }
                 }
                 Backing::Zero | Backing::Stack => {
-                    // FIXME: We could map a specific zero frame.
-                    let frame = (&FRAME_ALLOCATOR).allocate_frame().unwrap();
-                    unsafe {
-                        // SAFETY: We just allocated the frame, so we can do whatever.
-                        zero_frame(frame)?;
-                    }
+                    let point1 = unsafe { _rdtsc() };
 
-                    let mut flags = PageTableFlags::USER;
-                    if self.permissions.contains(MemoryPermissions::WRITE) {
-                        flags |= PageTableFlags::WRITABLE;
-                    }
+                    static ZERO_FRAME: Lazy<PhysFrame> = Lazy::new(|| {
+                        // FIXME: We could map a specific zero frame.
+                        let frame = (&FRAME_ALLOCATOR).allocate_frame().unwrap();
+                        unsafe {
+                            // SAFETY: We just allocated the frame, so we can do whatever.
+                            zero_frame(frame).unwrap();
+                        }
+                        frame
+                    });
+
+                    // FIXME: We could map a specific zero frame.
+                    let frame = *ZERO_FRAME;
+
+                    let mut flags = PageTableFlags::USER | PageTableFlags::COW;
                     if self.permissions.contains(MemoryPermissions::EXECUTE) {
                         flags |= PageTableFlags::EXECUTABLE;
                     }
@@ -1136,6 +1307,10 @@ impl Mapping {
                     unsafe {
                         map_page(page, new_entry, &mut &FRAME_ALLOCATOR)?;
                     }
+
+                    let point2 = unsafe { _rdtsc() };
+
+                    // log::info!("counter remove all {:?}", [point2,].map(|a| { a - point1 }));
                 }
             }
         }

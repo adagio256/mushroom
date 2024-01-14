@@ -11,7 +11,6 @@ use crate::{
 use core::{
     arch::{asm, global_asm},
     fmt,
-    iter::Step,
     marker::{PhantomData, PhantomPinned},
     num::NonZeroU64,
     ops::{Deref, Index, Range},
@@ -23,7 +22,7 @@ use bit_field::BitField;
 use bitflags::bitflags;
 use log::trace;
 use x86_64::{
-    instructions::tlb::Invlpgb,
+    instructions::tlb::flush,
     registers::control::Cr3,
     structures::paging::{
         FrameAllocator, FrameDeallocator, Page, PageTableIndex, PhysFrame, Size4KiB,
@@ -699,7 +698,7 @@ where
                     }
                 }
 
-                self.flush(true);
+                self.flush(true, false);
 
                 // Extract the freed frame and return it.
                 let phys_addr = PhysAddr::new_truncate(current_entry);
@@ -722,7 +721,12 @@ where
 }
 
 impl<L> ActivePageTableEntry<L> {
-    fn flush(&self, global: bool) {
+    fn flush(&self, global: bool, local: bool) {
+        if local || true {
+            flush(self.page().start_address());
+            return;
+        }
+
         INVLPGB.flush_page(self.page(), global);
     }
 
@@ -793,7 +797,18 @@ impl ActivePageTableEntry<Level1> {
         let _ = atomic_compare_exchange(&self.entry, old_entry.0.get(), new_entry.0.get())
             .map_err(|entry| PresentPageTableEntry::try_from(entry).unwrap())?;
 
-        self.flush(old_entry.global());
+        self.flush(old_entry.global(), old_entry.local());
+
+        Ok(())
+    }
+
+    pub unsafe fn remap_no_flush(
+        &self,
+        old_entry: PresentPageTableEntry,
+        new_entry: PresentPageTableEntry,
+    ) -> Result<(), PresentPageTableEntry> {
+        let _ = atomic_compare_exchange(&self.entry, old_entry.0.get(), new_entry.0.get())
+            .map_err(|entry| PresentPageTableEntry::try_from(entry).unwrap())?;
 
         Ok(())
     }
@@ -804,7 +819,7 @@ impl ActivePageTableEntry<Level1> {
     pub unsafe fn unmap(&self) -> PresentPageTableEntry {
         let old_entry = atomic_swap(&self.entry, 0);
         let old_entry = PresentPageTableEntry::try_from(old_entry).unwrap();
-        self.flush(old_entry.global());
+        self.flush(old_entry.global(), old_entry.local());
 
         // FIXME: Free up the frame.
         let _maybe_frame = unsafe { self.parent_table_entry().release_reference_count() };
@@ -822,6 +837,8 @@ impl ActivePageTableEntry<Level1> {
         add_mask.set_bit(USER_BIT, flags.contains(PageTableFlags::USER));
         let global = flags.contains(PageTableFlags::GLOBAL);
         add_mask.set_bit(GLOBAL_BIT, global);
+        let local = flags.contains(PageTableFlags::LOCAL);
+        add_mask.set_bit(LOCAL_BIT, local);
         let cow = flags.contains(PageTableFlags::COW);
         add_mask.set_bit(COW_BIT, cow);
         remove_mask.set_bit(
@@ -836,7 +853,7 @@ impl ActivePageTableEntry<Level1> {
         atomic_fetch_or(&self.entry, add_mask);
         atomic_fetch_and(&self.entry, !remove_mask);
 
-        self.flush(global);
+        self.flush(global, local);
     }
 
     pub unsafe fn remove_flags(&self, flags: PageTableFlags) {
@@ -848,6 +865,8 @@ impl ActivePageTableEntry<Level1> {
         remove_mask.set_bit(USER_BIT, flags.contains(PageTableFlags::USER));
         let global = flags.contains(PageTableFlags::GLOBAL);
         remove_mask.set_bit(GLOBAL_BIT, global);
+        let local = flags.contains(PageTableFlags::LOCAL);
+        remove_mask.set_bit(GLOBAL_BIT, local);
         let cow = flags.contains(PageTableFlags::COW);
         remove_mask.set_bit(COW_BIT, cow);
         add_mask.set_bit(
@@ -862,7 +881,8 @@ impl ActivePageTableEntry<Level1> {
         atomic_fetch_or(&self.entry, add_mask);
         atomic_fetch_and(&self.entry, !remove_mask);
 
-        self.flush(global);
+        // Do global and local make sense here?
+        self.flush(global, local);
     }
 
     pub fn entry(&self) -> Option<PresentPageTableEntry> {
@@ -956,6 +976,9 @@ const INITIALIZING_BIT: usize = 9;
 /// Indicates that the page is a copy on write page.
 const COW_BIT: usize = 10;
 
+// TODO: document
+const LOCAL_BIT: usize = 11;
+
 /// Bits that are used to reference count the entry.
 ///
 /// The reference count is represented as one less than the actual count. So if
@@ -1038,6 +1061,8 @@ bitflags! {
         const USER = 1 << 2;
         const GLOBAL = 1 << 3;
         const COW = 1 << 4;
+        const LOCAL = 1 << 5;
+        const DIRTY = 1 << 6;
     }
 }
 
@@ -1061,6 +1086,10 @@ impl PresentPageTableEntry {
         );
         let cow = flags.contains(PageTableFlags::COW);
         entry.set_bit(COW_BIT, cow);
+        let local = flags.contains(PageTableFlags::LOCAL);
+        entry.set_bit(LOCAL_BIT, local);
+        let dirty = flags.contains(PageTableFlags::DIRTY);
+        entry.set_bit(DIRTY_BIT, dirty);
 
         if cow {
             assert!(!writable);
@@ -1080,6 +1109,8 @@ impl PresentPageTableEntry {
         flags.set(PageTableFlags::GLOBAL, self.global());
         flags.set(PageTableFlags::EXECUTABLE, self.executable());
         flags.set(PageTableFlags::COW, self.cow());
+        flags.set(PageTableFlags::LOCAL, self.local());
+        flags.set(PageTableFlags::DIRTY, self.dirty());
         flags
     }
 
@@ -1101,6 +1132,14 @@ impl PresentPageTableEntry {
 
     pub fn cow(&self) -> bool {
         self.0.get().get_bit(COW_BIT)
+    }
+
+    pub fn local(&self) -> bool {
+        self.0.get().get_bit(LOCAL_BIT)
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.0.get().get_bit(DIRTY_BIT)
     }
 }
 

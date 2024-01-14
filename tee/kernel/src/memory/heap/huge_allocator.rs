@@ -55,6 +55,8 @@ where
             addr.next_multiple_of(align)
         };
 
+        assert!(HEAP.contains(addr));
+
         let addr = VirtAddr::new(addr);
         let base = Page::<Size4KiB>::from_start_address(addr).unwrap();
 
@@ -76,6 +78,17 @@ where
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        #[cfg(sanitize = "address")]
+        unsafe {
+            ptr.as_ptr().write(0);
+
+            crate::sanitize::mark(
+                ptr.as_ptr().cast_const().cast(),
+                layout.size().next_multiple_of(0x1000),
+                false,
+            );
+        }
+
         let pages = layout.size().div_ceil(0x1000);
 
         let addr = VirtAddr::from_ptr(ptr.as_ptr());

@@ -1,6 +1,7 @@
 use core::{
     fmt::{self, Debug},
     future::Future,
+    mem::ManuallyDrop,
     panic::Location,
     pin::Pin,
     task::{Context, Waker},
@@ -12,10 +13,7 @@ use crossbeam_queue::SegQueue;
 use crossbeam_utils::atomic::AtomicCell;
 use log::{debug, warn};
 
-use crate::{
-    supervisor::schedule_vcpu,
-    user::process::memory::{do_virtual_memory_op, VirtualMemoryActivator},
-};
+use crate::user::process::memory::{do_virtual_memory_op, VirtualMemoryActivator};
 
 pub mod mpmc;
 pub mod mpsc;
@@ -40,7 +38,7 @@ pub fn poll(vm_activator: &mut VirtualMemoryActivator) -> bool {
 
 struct Task {
     state: AtomicCell<TaskState>,
-    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    future: ManuallyDrop<Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>>,
     spawn_location: &'static Location<'static>,
 }
 
@@ -49,7 +47,7 @@ impl Task {
     fn new(future: impl Future<Output = ()> + Send + 'static) -> Arc<Self> {
         Arc::new(Self {
             state: AtomicCell::new(TaskState::Waiting),
-            future: Mutex::new(Box::pin(future)),
+            future: ManuallyDrop::new(Mutex::new(Box::pin(future))),
             spawn_location: Location::caller(),
         })
     }
@@ -69,7 +67,7 @@ impl Task {
 
             // Mark the task as done if the future has finished.
             if res.is_ready() {
-                debug!("{self:?} finished");
+                // debug!("{self:?} finished");
                 self.state.store(TaskState::Done);
                 return;
             }
@@ -117,7 +115,7 @@ impl Wake for Task {
         // Schedule the task if necessary.
         if matches!(prev_state, TaskState::Waiting) {
             SCHEDULED_THREADS.push(self);
-            schedule_vcpu();
+            // schedule_vcpu();
         }
     }
 }

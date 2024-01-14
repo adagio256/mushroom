@@ -546,11 +546,13 @@ pub enum RawExit {
     Exception = 1,
 }
 
+#[derive(Debug)]
 pub enum Exit {
     Syscall(SyscallArgs),
     PageFault(PageFaultExit),
 }
 
+#[derive(Debug)]
 pub struct PageFaultExit {
     pub addr: u64,
     pub code: PageFaultErrorCode,

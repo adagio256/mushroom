@@ -1,4 +1,9 @@
-use core::{any::type_name, cmp, ops::Deref};
+use core::{
+    any::type_name,
+    cmp,
+    ops::Deref,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
     fs::{
@@ -8,7 +13,10 @@ use crate::{
     spin::mutex::Mutex,
     user::process::{
         memory::{ActiveVirtualMemory, MemoryPermissions, VirtualMemory, VirtualMemoryActivator},
-        syscall::args::{EpollEvent, FdNum, FileMode, FileType, OpenFlags, Pointer, Stat, Whence},
+        syscall::{
+            args::{EpollEvent, FdNum, FileMode, FileType, OpenFlags, Pointer, Stat, Whence},
+            traits::ProfilingFuture,
+        },
     },
 };
 use alloc::{boxed::Box, collections::BTreeMap, format, sync::Arc, vec::Vec};
@@ -185,7 +193,7 @@ pub trait OpenFileDescription: Send + Sync + 'static {
         const MAX_BUFFER_LEN: usize = 8192;
         if len > MAX_BUFFER_LEN {
             len = MAX_BUFFER_LEN;
-            debug!("unoptimized read from {} truncated", type_name::<Self>());
+            // debug!("unoptimized read from {} truncated", type_name::<Self>());
         }
 
         let mut buf = [0; MAX_BUFFER_LEN];
@@ -239,6 +247,11 @@ pub trait OpenFileDescription: Send + Sync + 'static {
     fn pwrite(&self, pos: usize, buf: &[u8]) -> Result<usize> {
         let _ = pos;
         let _ = buf;
+        Err(Error::inval(()))
+    }
+
+    fn truncate(&self, length: u64) -> Result<()> {
+        let _ = length;
         Err(Error::inval(()))
     }
 
@@ -339,6 +352,8 @@ pub async fn do_io<R>(
     }
 }
 
+pub static USE_FROM_ASYNC_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub async fn do_io_with_vm<R, F>(
     fd: &(impl OpenFileDescription + ?Sized),
     events: Events,
@@ -354,8 +369,7 @@ where
         let (res, f) = VirtualMemoryActivator::use_from_async(vm.clone(), move |vm| {
             let res = callback(vm);
             (res, callback)
-        })
-        .await;
+        });
         callback = f;
 
         match res {

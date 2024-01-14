@@ -100,7 +100,7 @@ impl OpenFileDescription for Stderr {
 
     fn write(&self, buf: &[u8]) -> Result<usize> {
         let chunk = core::str::from_utf8(buf);
-        debug!("{chunk:02x?}");
+        // debug!("{chunk:02x?}");
         Ok(buf.len())
     }
 

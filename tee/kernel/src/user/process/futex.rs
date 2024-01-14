@@ -55,8 +55,7 @@ impl Futexes {
                 .push(FutexWaiter { sender, bitset });
 
             Ok(receiver)
-        })
-        .await?;
+        })?;
 
         if let Some(deadline) = deadline {
             select_biased! {

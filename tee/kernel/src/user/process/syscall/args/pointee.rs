@@ -27,7 +27,9 @@ use crate::{
     },
 };
 
-use super::{FdNum, Iovec, LinuxDirent64, LongOffset, Offset, Pointer, Stat, Timespec, WStatus};
+use super::{
+    FdNum, Iovec, LinuxDirent64, LongOffset, Offset, Pointer, SigInfo, Stat, Timespec, WStatus,
+};
 
 /// This trait is implemented by types for which userspace pointers can exist.
 pub trait Pointee {
@@ -427,8 +429,8 @@ pub struct Sigaction32 {
 pub struct Sigaction64 {
     sa_handler_or_sigaction: u64,
     sa_mask: Sigset,
-    flags: u64,
     sa_restorer: u64,
+    flags: u64,
 }
 
 impl TryFrom<Sigaction> for Sigaction32 {
@@ -916,3 +918,5 @@ impl TryFrom<OldLinuxDirent> for OldLinuxDirent64 {
         })
     }
 }
+
+impl AbiAgnosticPointee for SigInfo {}

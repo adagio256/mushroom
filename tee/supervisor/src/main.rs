@@ -33,6 +33,8 @@ mod reset_vector;
 mod rmp;
 
 fn main() -> ! {
+    // Disable cache?
+
     if cfg!(not(feature = "harden")) {
         log::set_logger(&SerialLogger).unwrap();
         log::set_max_level(LevelFilter::Trace);

@@ -1,6 +1,7 @@
 //! This module is responsible for handling CPU exceptions.
 
 use core::mem::offset_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::{alloc::Layout, arch::asm, ptr::null_mut};
 
 use crate::spin::lazy::Lazy;
@@ -51,7 +52,7 @@ pub fn switch_stack(f: extern "C" fn() -> !) -> ! {
 
 fn allocate_stack() -> VirtAddr {
     // FIXME: Guard pages.
-    let stack_layout = Layout::from_size_align(0x10000, 16).unwrap();
+    let stack_layout = Layout::from_size_align(0x10_0000, 16).unwrap();
     let stack = unsafe { alloc(stack_layout) };
     assert_ne!(stack, null_mut());
     let end_of_stack = unsafe { stack.add(stack_layout.size()) };
@@ -106,7 +107,11 @@ pub fn load_idt() {
     static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         let mut idt = InterruptDescriptorTable::new();
         idt.page_fault.set_handler_fn(page_fault_handler);
-        idt.double_fault.set_handler_fn(double_fault_handler);
+        // idt.double_fault.set_handler_fn(double_fault_handler);
+        // idt.segment_not_present
+        // .set_handler_fn(segment_not_present_handler);
+        // idt.general_protection_fault
+        // .set_handler_fn(general_protection_fault_handler);
         idt[0x80]
             .set_handler_fn(int0x80_handler)
             .set_privilege_level(PrivilegeLevel::Ring3);
@@ -157,39 +162,76 @@ extern "x86-interrupt" fn kernel_page_fault_handler(
     page_fault_handler_impl(frame, error_code);
 }
 
-fn page_fault_handler_impl(frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
+fn page_fault_handler_impl(mut frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     let _guard = SwapGsGuard::new(&frame);
 
     let cr2 = Cr2::read_raw();
 
+    static LAST_CR2: AtomicU64 = AtomicU64::new(0);
+    let last = LAST_CR2.swap(cr2, Ordering::SeqCst);
+    if last == cr2 {
+        debug!(target:"other", "double page fault: {cr2}");
+    }
+
     trace!("page fault");
+
+    // debug!(target:"other", "page fault: {cr2}");
+
+    unsafe {
+        frame.as_mut().update(|a| a.instruction_pointer += 2u64);
+    }
+    return;
 
     assert!(error_code.contains(PageFaultErrorCode::USER_MODE));
 
-        if let Ok(cr2) = VirtAddr::try_new(cr2) {
-            if let Some(entry) = entry_for_page(Page::containing_address(cr2)) {
-                error!("page is mapped to {entry:?}");
-            } else {
-                error!("page is not mapped");
-            }
+    if let Ok(cr2) = VirtAddr::try_new(cr2) {
+        if let Some(entry) = entry_for_page(Page::containing_address(cr2)) {
+            error!("page is mapped to {entry:?}");
         } else {
-            error!("cr2 is not a canonical address");
+            error!("page is not mapped");
         }
+    } else {
+        error!("cr2 is not a canonical address");
+    }
 
-        #[cfg(sanitize = "address")]
-        crate::sanitize::page_fault_handler(&frame);
+    #[cfg(sanitize = "address")]
+    crate::sanitize::page_fault_handler(&frame);
 
-        panic!(
-            "page fault {error_code:?} trying to access {cr2:#018x} at ip {:#018x}",
-            frame.instruction_pointer
-        );
+    panic!(
+        "page fault {error_code:?} trying to access {cr2:#018x} at ip {:#018x}",
+        frame.instruction_pointer
+    );
 }
 
 #[no_sanitize(address)]
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, code: u64) -> ! {
     let _guard = SwapGsGuard::new(&frame);
 
-    panic!("double fault {frame:x?} {code:x?}");
+    panic!("double fault {code:x?} {frame:x?}");
+}
+
+#[no_sanitize(address)]
+extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame, code: u64) {
+    let _guard = SwapGsGuard::new(&frame);
+
+    // without_smap(|| unsafe {
+    // let instruction = frame.instruction_pointer.as_mut_ptr::<[u8; 8]>();
+    // info!(target:"rofl","{:02x?}", instruction.read_volatile());
+    // });
+
+    panic!("segment not present {code:x?} {frame:x?}");
+}
+
+#[no_sanitize(address)]
+extern "x86-interrupt" fn general_protection_fault_handler(frame: InterruptStackFrame, code: u64) {
+    let _guard = SwapGsGuard::new(&frame);
+
+    // without_smap(|| unsafe {
+    // let instruction = frame.instruction_pointer.as_mut_ptr::<[u8; 8]>();
+    // info!(target:"rofl","{:02x?}", instruction.read_volatile());
+    // });
+
+    panic!("general protection fault {code:x?} {frame:x?}");
 }
 
 #[no_sanitize(address)]

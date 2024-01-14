@@ -9,7 +9,9 @@ use alloc::vec::Vec;
 use arrayvec::ArrayVec;
 use bit_field::BitArray;
 use log::{debug, warn};
-use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame, Size2MiB, Size4KiB};
+use x86_64::structures::paging::{
+    FrameAllocator, FrameDeallocator, PageSize, PhysFrame, Size2MiB, Size4KiB,
+};
 
 use crate::supervisor;
 
@@ -39,7 +41,9 @@ struct BitmapFrameAllocatorState {
 
 impl BitmapFrameAllocatorState {
     fn bitmaps(&mut self) -> impl Iterator<Item = &mut Bitmap> + '_ {
-        self.r#static.iter_mut().chain(self.dynamic.iter_mut())
+        self.r#static
+            .iter_mut()
+            .chain(self.dynamic.iter_mut().rev())
     }
 
     fn add_bitmap(&mut self, bitmap: Bitmap) {
@@ -58,6 +62,24 @@ impl BitmapFrameAllocatorState {
             self.r#static.swap_remove(idx);
         } else {
             self.dynamic.swap_remove(idx - self.r#static.len());
+        }
+    }
+
+    fn sort(&mut self) {
+        loop {
+            self.r#static.sort_unstable_by_key(|b| b.base);
+            self.dynamic.sort_unstable_by_key(|b| b.base);
+
+            if let Some((last, first)) = self
+                .r#static
+                .last_mut()
+                .zip(self.dynamic.first_mut())
+                .filter(|(last, first)| last.base > first.base)
+            {
+                core::mem::swap(last, first);
+            } else {
+                break;
+            }
         }
     }
 
@@ -161,6 +183,7 @@ unsafe impl FrameAllocator<Size4KiB> for &BitmapFrameAllocator {
         let mut bitmap = Bitmap::new()?;
         let frame = bitmap.allocate().unwrap();
         state.add_bitmap(bitmap);
+        state.sort();
 
         Some(frame)
     }
@@ -168,23 +191,40 @@ unsafe impl FrameAllocator<Size4KiB> for &BitmapFrameAllocator {
 
 impl FrameDeallocator<Size4KiB> for &BitmapFrameAllocator {
     unsafe fn deallocate_frame(&mut self, frame: PhysFrame) {
+        // return;
+
         let mut state = self.state.lock();
-        let mut i = 0;
-        loop {
-            let bitmap = &mut state[i];
-            if !bitmap.contains(frame) {
-                i += 1;
-                continue;
-            }
 
-            unsafe {
-                bitmap.deallocate(frame);
-            }
-            if bitmap.used == 0 {
-                state.swap_remove(i);
-            }
+        let state = &mut *state;
+        let r#static = &mut state.r#static;
+        let dynamic = &mut state.dynamic;
 
-            return;
+        let key = frame.start_address().align_down(Size2MiB::SIZE);
+        let bitmap = r#static
+            .binary_search_by_key(&key, |b| b.base.start_address())
+            .map(|idx| &mut r#static[idx])
+            .or_else(|_| {
+                dynamic
+                    .binary_search_by_key(&key, |b| b.base.start_address())
+                    .map(|idx| &mut dynamic[idx])
+            })
+            .unwrap();
+
+        // let bitmap = &mut state[i];
+        assert!(bitmap.contains(frame));
+        // if !bitmap.contains(frame) {
+        // i += 1;
+        // continue;
+        // }
+
+        unsafe {
+            bitmap.deallocate(frame);
+        }
+        if bitmap.used == 0 {
+            // state.swap_remove(i);
+
+            r#static.retain(|a| a.used > 0);
+            dynamic.retain(|a| a.used > 0);
         }
     }
 }
