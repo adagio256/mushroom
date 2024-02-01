@@ -16,7 +16,7 @@ use x86_64::{instructions::random::RdRand, VirtAddr};
 
 use super::{
     memory::{ActiveVirtualMemory, MemoryPermissions, VmSize},
-    syscall::{args::FileMode, cpu_state::CpuState},
+    syscall::{args::FileMode, cpu_state::CpuState, traits::Abi},
 };
 use crate::{
     error::{Error, Result},
@@ -36,6 +36,7 @@ impl ActiveVirtualMemory<'_, '_> {
         }
 
         let mut phdr = None;
+        let abi = if elf.is_64 { Abi::Amd64 } else { Abi::I386 };
 
         for ph in elf.program_headers.iter().filter(|ph| ph.p_type == PT_LOAD) {
             let addr = VirtAddr::new(base + ph.p_vaddr);
@@ -53,11 +54,11 @@ impl ActiveVirtualMemory<'_, '_> {
                 permissions |= MemoryPermissions::READ;
             }
 
-            self.mmap_into(Some(addr), len, offset, elf_bytes.clone(), permissions)?;
+            self.mmap_into(Some(addr), len, offset, elf_bytes.clone(), permissions, abi)?;
 
             let zero_len = ph.p_memsz - ph.p_filesz;
             if zero_len != 0 {
-                self.mmap_zero(Some(addr + ph.p_filesz), zero_len, permissions)?;
+                self.mmap_zero(Some(addr + ph.p_filesz), zero_len, permissions, abi)?;
             }
 
             if (ph.p_offset..ph.p_offset + ph.p_filesz).contains(&elf.header.e_phoff) {
@@ -110,7 +111,7 @@ impl ActiveVirtualMemory<'_, '_> {
         } else {
             VmSize::ThirtyTwo
         };
-        self.init(vm_size);
+        let abi = if elf.is_64 { Abi::Amd64 } else { Abi::I386 };
 
         let info = self.load_elf(0x4000_0000_0000, elf_bytes)?;
         let mut entrypoint = info.entry;
@@ -132,12 +133,13 @@ impl ActiveVirtualMemory<'_, '_> {
 
         // Create stack.
         let len = 0x10_0000;
-        let stack = self.allocate_stack(None, len)? + len;
+        let stack = self.allocate_stack(None, len, abi)? + len;
 
         self.mmap_zero(
             Some(stack),
             0x4000,
             MemoryPermissions::READ | MemoryPermissions::WRITE,
+            abi,
         )?;
 
         let mut addr = stack;

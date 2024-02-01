@@ -140,6 +140,66 @@ pub unsafe fn remap_page(
     unsafe { level1_entry.remap(old_entry, new_entry) }
 }
 
+/// Map a page regardless of whether there's already a page mapped there.
+pub unsafe fn set_todo_rename(
+    page: Page,
+    entry: PresentPageTableEntry,
+    allocator: &mut (impl FrameAllocator<Size4KiB> + FrameDeallocator<Size4KiB>),
+) -> Result<()> {
+    trace!("mapping page {page:?}->{entry:?} pml4={:?}", Cr3::read().0);
+
+    let level4 = ActivePageTable::get();
+    let level4_entry = &level4[page.p4_index()];
+
+    let level3_guard = level4_entry.acquire(entry.flags(), allocator)?;
+    let level3 = &*level3_guard;
+    let level3_entry = &level3[page.p3_index()];
+
+    let level2_guard = level3_entry.acquire(entry.flags(), allocator)?;
+    let level2 = &*level2_guard;
+    let level2_entry = &level2[page.p2_index()];
+
+    let level1_guard = level2_entry.acquire(entry.flags(), allocator)?;
+    let level1 = &*level1_guard;
+    let level1_entry = &level1[page.p1_index()];
+
+    unsafe {
+        level1_entry.set_todo_rename(entry);
+    }
+
+    Ok(())
+}
+
+/// Map a page regardless of whether there's already a page mapped there.
+pub unsafe fn try_set_todo_rename(page: Page, entry: PresentPageTableEntry) {
+    trace!("mapping page {page:?}->{entry:?} pml4={:?}", Cr3::read().0);
+
+    let level4 = ActivePageTable::get();
+    let level4_entry = &level4[page.p4_index()];
+
+    let Some(level3_guard) = level4_entry.acquire_existing() else {
+        return;
+    };
+    let level3 = &*level3_guard;
+    let level3_entry = &level3[page.p3_index()];
+
+    let Some(level2_guard) = level3_entry.acquire_existing() else {
+        return;
+    };
+    let level2 = &*level2_guard;
+    let level2_entry = &level2[page.p2_index()];
+
+    let Some(level1_guard) = level2_entry.acquire_existing() else {
+        return;
+    };
+    let level1 = &*level1_guard;
+    let level1_entry = &level1[page.p1_index()];
+
+    unsafe {
+        level1_entry.set_todo_rename(entry);
+    }
+}
+
 pub unsafe fn unmap_page(page: Page) -> PresentPageTableEntry {
     trace!("unmapping page {page:?}");
 
@@ -174,6 +234,33 @@ pub unsafe fn add_flags(page: Page, flags: PageTableFlags) {
     let level2_entry = &level2[page.p2_index()];
 
     let level1_guard = level2_entry.acquire_existing().unwrap();
+    let level1 = &*level1_guard;
+    let level1_entry = &level1[page.p1_index()];
+
+    unsafe {
+        level1_entry.add_flags(flags);
+    }
+}
+
+pub unsafe fn try_add_flags(page: Page, flags: PageTableFlags) {
+    let level4 = ActivePageTable::get();
+    let level4_entry = &level4[page.p4_index()];
+
+    let Some(level3_guard) = level4_entry.acquire_existing() else {
+        return;
+    };
+    let level3 = &*level3_guard;
+    let level3_entry = &level3[page.p3_index()];
+
+    let Some(level2_guard) = level3_entry.acquire_existing() else {
+        return;
+    };
+    let level2 = &*level2_guard;
+    let level2_entry = &level2[page.p2_index()];
+
+    let Some(level1_guard) = level2_entry.acquire_existing() else {
+        return;
+    };
     let level1 = &*level1_guard;
     let level1_entry = &level1[page.p1_index()];
 
@@ -806,6 +893,37 @@ impl ActivePageTableEntry<Level1> {
         Ok(())
     }
 
+    pub unsafe fn try_remap(
+        &self,
+        old_entry: PresentPageTableEntry,
+        new_entry: PresentPageTableEntry,
+    ) -> Result<(), Option<PresentPageTableEntry>> {
+        let _ = atomic_compare_exchange(&self.entry, old_entry.0.get(), new_entry.0.get())
+            .map_err(|entry| PresentPageTableEntry::try_from(entry).ok())?;
+
+        self.flush(old_entry.global());
+
+        Ok(())
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the page is already mapped.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must not already be mapped.
+    pub unsafe fn set_todo_rename(&self, entry: PresentPageTableEntry) {
+        let res = atomic_swap(&self.entry, entry.0.get());
+        if res == 0 {
+            self.parent_table_entry()
+                .increase_reference_count()
+                .unwrap();
+        } else {
+            self.flush(res.get_bit(GLOBAL_BIT));
+        }
+    }
+
     /// # Panics
     ///
     /// Panics if the page isn't mapped.
@@ -845,6 +963,32 @@ impl ActivePageTableEntry<Level1> {
         atomic_fetch_and(&self.entry, !remove_mask);
 
         self.flush(global);
+    }
+
+    pub unsafe fn try_add_flags(&self, flags: PageTableFlags) {
+        let mut maybe_entry = self.entry();
+
+        while let Some(old_entry) = maybe_entry {
+            let new_entry =
+                PresentPageTableEntry::new(old_entry.frame(), old_entry.flags() | flags);
+            match self.try_remap(old_entry, new_entry) {
+                Ok(_) => break,
+                Err(new_maybe_entry) => maybe_entry = new_maybe_entry,
+            }
+        }
+    }
+
+    pub unsafe fn try_remove_flags(&self, flags: PageTableFlags) {
+        let mut maybe_entry = self.entry();
+
+        while let Some(old_entry) = maybe_entry {
+            let new_entry =
+                PresentPageTableEntry::new(old_entry.frame(), old_entry.flags() & !flags);
+            match self.try_remap(old_entry, new_entry) {
+                Ok(_) => break,
+                Err(new_maybe_entry) => maybe_entry = new_maybe_entry,
+            }
+        }
     }
 
     pub unsafe fn remove_flags(&self, flags: PageTableFlags) {

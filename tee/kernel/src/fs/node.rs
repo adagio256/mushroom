@@ -4,6 +4,7 @@ use core::{
 };
 
 use crate::{
+    memory::page::UserPage,
     spin::lazy::Lazy,
     user::process::{
         syscall::args::{ExtractableThreadState, OpenFlags},
@@ -132,7 +133,7 @@ pub trait INode: Send + Sync + 'static {
 
     // File related functions
 
-    fn read_snapshot(&self) -> Result<FileSnapshot> {
+    fn get_page(&self, idx: usize) -> Result<UserPage> {
         Err(Error::acces(()))
     }
 
@@ -169,30 +170,12 @@ fn resolve_links(
 }
 
 #[derive(Clone)]
-pub struct FileSnapshot(Arc<Cow<'static, [u8]>>);
+pub struct FileSnapshot(Arc<[UserPage]>);
 
 impl FileSnapshot {
     pub fn empty() -> Self {
-        static EMPTY: Lazy<FileSnapshot> = Lazy::new(|| FileSnapshot(Arc::new(Cow::Borrowed(&[]))));
+        static EMPTY: Lazy<FileSnapshot> = Lazy::new(|| FileSnapshot(Arc::new([])));
         EMPTY.clone()
-    }
-}
-
-impl From<Arc<Cow<'static, [u8]>>> for FileSnapshot {
-    fn from(value: Arc<Cow<'static, [u8]>>) -> Self {
-        if value.is_empty() {
-            return Self::empty();
-        }
-
-        Self(value)
-    }
-}
-
-impl Deref for FileSnapshot {
-    type Target = Cow<'static, [u8]>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 

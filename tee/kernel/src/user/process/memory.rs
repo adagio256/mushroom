@@ -1,14 +1,18 @@
 use core::{
     arch::asm, borrow::Borrow, cmp, intrinsics::volatile_copy_nonoverlapping_memory, iter::Step,
-    ops::Deref,
+    ops::Deref, ptr::NonNull,
 };
 
 use crate::{
-    memory::invlpgb::INVLPGB,
+    memory::{
+        invlpgb::INVLPGB,
+        page::{SharedCoWUserPage, UserPage},
+        pagetable::{set_todo_rename, try_set_todo_rename},
+    },
     rt::spawn,
     spin::{lazy::Lazy, mutex::Mutex},
 };
-use alloc::{borrow::Cow, boxed::Box, ffi::CString, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, ffi::CString, sync::Arc, vec::Vec};
 use bit_field::BitField;
 use bitflags::bitflags;
 use crossbeam_queue::SegQueue;
@@ -149,43 +153,36 @@ impl VirtualMemory {
 
         debug!(target: "kernel::exception", "{addr:?} {error_code:?}");
 
-        let state = self.state.lock();
-        let state = state.initialized();
+        let mut required_flags = PageTableFlags::empty();
+        required_flags.set(
+            PageTableFlags::WRITABLE,
+            error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+        );
+        required_flags.set(
+            PageTableFlags::EXECUTABLE,
+            error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
+        );
 
-        let mapping_opt = state.mappings.iter().find(|mapping| mapping.contains(addr));
-        let Some(mapping) = mapping_opt else {
-            return false;
+        // TODO: remove this.
+        let vm = ActiveVirtualMemory {
+            activator: &mut VirtualMemoryActivator(()),
+            virtual_memory: self,
         };
-
-        // Ensure that the page is mapped.
-        unsafe {
-            mapping.make_readable(page).unwrap();
-        }
-        // Ensure that the page has the permissions requested in the error code.
-        if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
-            unsafe {
-                mapping.make_writable(page).unwrap();
-            }
-        }
-        if error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH) {
-            unsafe {
-                mapping.make_executable(page).unwrap();
-            }
-        }
-
-        true
+        let res = vm.map_page(page, required_flags);
+        res.is_ok()
     }
 
     /// Create a deep copy of the memory.
     pub fn clone(&self, vm_activator: &mut VirtualMemoryActivator) -> Result<Self> {
         let mut this = Self::new();
-        *this.state.get_mut() = self.state.lock().clone();
+        // *this.state.get_mut() = self.state.lock().clone();
 
-        vm_activator.activate(self, |vm| {
-            vm.find_dirty_userspace_pages(|page, content, vm_activator| {
-                vm_activator.activate(&this, |vm| vm.force_write(page, content))
-            })
-        })?;
+        // vm_activator.activate(self, |vm| {
+        // vm.find_dirty_userspace_pages(|page, content, vm_activator| {
+        // vm_activator.activate(&this, |vm| vm.force_write(page, content))
+        // })
+        // })?;
+        todo!();
 
         Ok(this)
     }
@@ -210,18 +207,7 @@ impl Default for VirtualMemory {
 
 impl Drop for VirtualMemory {
     fn drop(&mut self) {
-        let state = self.state.get_mut();
-        if let VirtualMemoryState::Initialized(s) = state {
-            if !s.mappings.is_empty() {
-                let this = core::mem::take(self);
-                spawn(async move {
-                    VirtualMemoryActivator::use_from_async(Arc::new(this), |a| {
-                        a.unmap(VirtAddr::new(0), !0)
-                    })
-                    .await;
-                });
-            }
-        }
+        todo!()
     }
 }
 
@@ -235,8 +221,36 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
         self.activator
     }
 
-    pub fn init(&mut self, vm_size: VmSize) {
-        self.state.lock().init(vm_size)
+    pub fn map_page(&self, page: Page, required_flags: PageTableFlags) -> Result<()> {
+        let state = self.state.lock();
+        let p = state.pages.get(&page).ok_or_else(|| Error::fault(()))?;
+        let entry = p.entry();
+        if !entry.flags().contains(required_flags) {
+            return Err(Error::fault(()));
+        }
+
+        unsafe {
+            set_todo_rename(page, entry, &mut &FRAME_ALLOCATOR)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn map_addrs(
+        &self,
+        addr: VirtAddr,
+        len: usize,
+        required_flags: PageTableFlags,
+    ) -> Result<()> {
+        assert_ne!(len, 0);
+
+        let start = Page::containing_address(addr);
+        let end = Page::containing_address(addr + (len - 1));
+        for page in start..=end {
+            self.map_page(page, required_flags)?;
+        }
+
+        Ok(())
     }
 
     pub fn read_bytes(&self, addr: VirtAddr, bytes: &mut [u8]) -> Result<()> {
@@ -248,40 +262,9 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
             return Ok(());
         }
 
-        let state = self.state.lock();
-        let state = state.initialized();
+        self.map_addrs(addr, bytes.len(), PageTableFlags::empty())?;
 
-        let start = addr;
-        let end_inclusive = addr + (bytes.len() - 1);
-
-        let start_page = Page::<Size4KiB>::containing_address(start);
-        let end_inclusive_page = Page::<Size4KiB>::containing_address(end_inclusive);
-
-        for page in Page::range_inclusive(start_page, end_inclusive_page) {
-            let copy_start = cmp::max(page.start_address(), start);
-            let copy_end_inclusive = cmp::min(page.start_address() + 0xfffu64, end_inclusive);
-
-            let mapping = state
-                .mappings
-                .iter()
-                .find(|mapping| mapping.contains_page(page))
-                .ok_or(Error::fault(()))?;
-            let ptr = unsafe { mapping.make_readable(page)? };
-
-            let src_offset = usize::try_from(copy_start - addr).unwrap();
-
-            let copy_start_offset = usize::from(copy_start.page_offset());
-            let copy_end_inclusive_offset = usize::from(copy_end_inclusive.page_offset());
-            let len = copy_end_inclusive_offset - copy_start_offset + 1;
-
-            without_smap(|| unsafe {
-                core::intrinsics::volatile_copy_nonoverlapping_memory(
-                    bytes.as_mut_ptr().add(src_offset),
-                    ptr.cast::<u8>().add(copy_start_offset),
-                    len,
-                );
-            });
-        }
+        try_read_user_fast(addr, bytes).unwrap();
 
         Ok(())
     }
@@ -332,7 +315,11 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
     }
 
     pub fn write_bytes(&self, addr: VirtAddr, bytes: &[u8]) -> Result<()> {
-        if bytes.is_empty() {
+        unsafe { self.write_bytes_volatile(addr, NonNull::from(bytes)) }
+    }
+
+    pub unsafe fn write_bytes_volatile(&self, addr: VirtAddr, bytes: NonNull<[u8]>) -> Result<()> {
+        if bytes.len() == 0 {
             return Ok(());
         }
 
@@ -340,38 +327,9 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
             return Ok(());
         }
 
-        let state = self.state.lock();
-        let state = state.initialized();
+        self.map_addrs(addr, bytes.len(), PageTableFlags::WRITABLE)?;
 
-        let start = addr;
-        let end_inclusive = addr + (bytes.len() - 1);
-
-        let start_page = Page::<Size4KiB>::containing_address(start);
-        let end_inclusive_page = Page::<Size4KiB>::containing_address(end_inclusive);
-
-        for page in Page::range_inclusive(start_page, end_inclusive_page) {
-            let copy_start = cmp::max(page.start_address(), start);
-            let copy_end_inclusive = cmp::min(page.start_address() + 0xfffu64, end_inclusive);
-
-            let mapping = state
-                .mappings
-                .iter()
-                .find(|mapping| mapping.contains_page(page))
-                .ok_or(Error::fault(()))?;
-            let ptr = unsafe { mapping.make_writable(page)? };
-
-            let src_offset = usize::try_from(copy_start - addr).unwrap();
-
-            let copy_start_offset = usize::from(copy_start.page_offset());
-            let copy_end_inclusive_offset = usize::from(copy_end_inclusive.page_offset());
-            let len = copy_end_inclusive_offset - copy_start_offset + 1;
-
-            without_smap(|| unsafe {
-                let dst = ptr.cast::<u8>().add(copy_start_offset);
-                let src = bytes.as_ptr().add(src_offset);
-                core::intrinsics::volatile_copy_nonoverlapping_memory(dst, src, len);
-            });
-        }
+        try_write_user_fast(bytes, addr).unwrap();
 
         Ok(())
     }
@@ -399,36 +357,40 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
     }
 
     pub fn force_write(&self, page: Page, bytes: &[u8; 0x1000]) -> Result<()> {
-        let mut state = self.state.lock();
-        let state = state.initialized_mut();
+        // let mut state = self.state.lock();
+        // let p = state.pages.get(&page).ok_or_else(|| Error::fault(()))?;
+        // let content = p.content_make_mut();
 
-        let mapping = state
-            .mappings
-            .iter_mut()
-            .find(|mapping| mapping.contains_page(page))
-            .ok_or(Error::fault(()))?;
+        // content.0.copy_from_slice(bytes);
 
-        let writeable = mapping.permissions.contains(MemoryPermissions::WRITE);
-        if !writeable {
-            mapping.permissions |= MemoryPermissions::WRITE;
-        }
+        // let mapping = state
+        //     .mappings
+        //     .iter_mut()
+        //     .find(|mapping| mapping.contains_page(page))
+        //     .ok_or(Error::fault(()))?;
 
-        let ptr = unsafe { mapping.make_writable(page)? };
+        // let writeable = mapping.permissions.contains(MemoryPermissions::WRITE);
+        // if !writeable {
+        //     mapping.permissions |= MemoryPermissions::WRITE;
+        // }
 
-        without_smap(|| unsafe {
-            let dst = ptr.cast::<u8>();
-            let src = bytes.as_ptr();
-            core::intrinsics::volatile_copy_nonoverlapping_memory(dst, src, bytes.len());
-        });
+        // let ptr = unsafe { mapping.make_writable(page)? };
 
-        if !writeable {
-            mapping.permissions.remove(MemoryPermissions::WRITE);
-            unsafe {
-                remove_flags(page, PageTableFlags::WRITABLE);
-            }
-        }
+        // without_smap(|| unsafe {
+        //     let dst = ptr.cast::<u8>();
+        //     let src = bytes.as_ptr();
+        //     core::intrinsics::volatile_copy_nonoverlapping_memory(dst, src, bytes.len());
+        // });
 
-        Ok(())
+        // if !writeable {
+        //     mapping.permissions.remove(MemoryPermissions::WRITE);
+        //     unsafe {
+        //         remove_flags(page, PageTableFlags::WRITABLE);
+        //     }
+        // }
+
+        // Ok(())
+        todo!()
     }
 
     pub fn mprotect(&self, addr: VirtAddr, len: u64, prot: ProtFlags) -> Result<()> {
@@ -439,87 +401,29 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
         if !addr.is_aligned(0x1000u64) || len % 0x1000 != 0 {
             return Err(Error::inval(()));
         }
-        let addr = Page::from_start_address(addr).unwrap();
-        let num_pages = len / 4096;
 
         let mut state = self.state.lock();
-        let state = state.initialized_mut();
 
-        loop {
-            let mapping = state
-                .mappings
-                .iter_mut()
-                .filter(|m| m.contains_page_range(addr, num_pages))
-                .min_by_key(|m| m.start)
-                .ok_or(Error::fault(()))?;
+        let start = Page::containing_address(addr);
+        let end = Page::containing_address(addr + (len - 1));
+        for page in start..=end {
+            let p = state.pages.get(&page).ok_or_else(|| Error::fault(()))?;
+            p.set_perms(MemoryPermissions::from(prot));
 
-            let new_page = cmp::max(addr, mapping.start);
-            let len = num_pages - (new_page - addr);
-            let addr = new_page;
-
-            let start_offset = addr - mapping.start;
-            if start_offset > 0 {
-                let mut new_mapping = mapping.split(start_offset);
-                let new_permissions = MemoryPermissions::from(prot);
-                let old_permissions =
-                    core::mem::replace(&mut new_mapping.permissions, new_permissions);
-
-                // Check if permissions have been removed.
-                let removed_permissions = !new_permissions & old_permissions;
-                let flags = PageTableFlags::from(removed_permissions);
-                if !flags.is_empty() {
-                    let start = new_mapping.start;
-                    let end_inclusive = new_mapping.end();
-                    for page in start..end_inclusive {
-                        unsafe {
-                            remove_flags(page, flags);
-                        }
-                    }
-                }
-
-                state.mappings.push(new_mapping);
-
-                continue;
+            unsafe {
+                try_set_todo_rename(page, p.entry());
             }
-
-            let new_mapping = if mapping.num_pages > len {
-                Some(mapping.split(len))
-            } else {
-                None
-            };
-
-            let new_permissions = MemoryPermissions::from(prot);
-            let old_permissions = core::mem::replace(&mut mapping.permissions, new_permissions);
-
-            // Check if permissions have been removed.
-            let removed_permissions = !new_permissions & old_permissions;
-            let flags = PageTableFlags::from(removed_permissions);
-            if !flags.is_empty() {
-                let start = mapping.start;
-                let end_inclusive = mapping.end() - 1u64;
-                for page in start..=end_inclusive {
-                    unsafe {
-                        remove_flags(page, flags);
-                    }
-                }
-            }
-
-            if let Some(new_mapping) = new_mapping {
-                state.mappings.push(new_mapping);
-            }
-
-            break;
         }
 
         Ok(())
     }
 
-    pub fn allocate_stack(&self, addr: Option<VirtAddr>, len: u64) -> Result<VirtAddr> {
-        let addr = self.add_mapping(
+    pub fn allocate_stack(&self, addr: Option<VirtAddr>, len: u64, abi: Abi) -> Result<VirtAddr> {
+        let addr = self.mmap_zero(
             addr,
             len,
             MemoryPermissions::READ | MemoryPermissions::WRITE,
-            Backing::Stack,
+            abi,
         )?;
         Ok(addr)
     }
@@ -531,12 +435,14 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
         offset: u64,
         bytes: FileSnapshot,
         permissions: MemoryPermissions,
+        abi: Abi,
     ) -> Result<VirtAddr> {
         self.add_mapping(
             addr,
             len,
             permissions,
             Backing::File(FileBacking { offset, bytes }),
+            abi,
         )
     }
 
@@ -545,28 +451,42 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
         addr: Option<VirtAddr>,
         len: u64,
         permissions: MemoryPermissions,
+        abi: Abi,
     ) -> Result<VirtAddr> {
-        self.add_mapping(addr, len, permissions, Backing::Zero)
+        assert_ne!(len, 0);
+
+        let mut state = self.state.lock();
+        let addr = state.find_free_address(len, abi);
+
+        let start = Page::containing_address(addr);
+        let end = Page::containing_address(addr + (len - 1));
+        for page in start..=end {
+            state.pages.insert(
+                page,
+                UserPage::SharedCow(SharedCoWUserPage::zeroed(permissions)),
+            );
+        }
+
+        Ok(addr)
     }
 
-    fn add_mapping(
+    fn add_mapping2(
         &self,
         addr: Option<VirtAddr>,
         len: u64,
         permissions: MemoryPermissions,
         backing: Backing,
+        abi: Abi,
     ) -> Result<VirtAddr> {
         assert!(len < (1 << 47), "mapping of size {len:#x} can never exist");
 
         let mut state = self.state.lock();
-        let state = state.initialized_mut();
 
-        state.add_mapping(addr, len, permissions, backing)
+        state.add_mapping(addr, len, permissions, backing, abi)
     }
 
     pub fn unmap(&mut self, addr: VirtAddr, len: u64) {
         let mut state = self.state.lock();
-        let state = state.initialized_mut();
         state.unmap(addr, len)
     }
 
@@ -584,12 +504,12 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
         }
     }
 
-    pub fn brk_end(&mut self) -> Result<VirtAddr> {
-        self.state.lock().initialized_mut().brk_end()
+    pub fn brk_end(&mut self, abi: Abi) -> Result<VirtAddr> {
+        self.state.lock().brk_end(abi)
     }
 
-    pub fn set_brk_end(&mut self, brk_end: u64) -> Result<VirtAddr> {
-        self.state.lock().initialized_mut().set_brk_end(brk_end)
+    pub fn set_brk_end(&mut self, brk_end: u64, abi: Abi) -> Result<VirtAddr> {
+        self.state.lock().set_brk_end(brk_end, abi)
     }
 }
 
@@ -601,74 +521,45 @@ impl Deref for ActiveVirtualMemory<'_, '_> {
     }
 }
 
-#[derive(Clone)]
-enum VirtualMemoryState {
-    Uninitialized,
-    Initialized(InitializedVirtualMemoryState),
-}
-
-#[derive(Clone)]
-struct InitializedVirtualMemoryState {
-    vm_size: VmSize,
-    mappings: Vec<Mapping>,
+struct VirtualMemoryState {
+    pages: BTreeMap<Page, UserPage>,
     brk: Option<Brk>,
 }
 
 impl VirtualMemoryState {
     pub fn new() -> Self {
-        Self::Uninitialized
-    }
-
-    pub fn init(&mut self, vm_size: VmSize) {
-        assert!(matches!(self, Self::Uninitialized));
-        *self = Self::Initialized(InitializedVirtualMemoryState {
-            vm_size,
-            mappings: Vec::new(),
+        Self {
+            pages: BTreeMap::new(),
             brk: None,
-        });
-    }
-
-    pub fn initialized(&self) -> &InitializedVirtualMemoryState {
-        match self {
-            VirtualMemoryState::Uninitialized => {
-                panic!("virtual memory state hasn't been initialized")
-            }
-            VirtualMemoryState::Initialized(i) => i,
         }
     }
 
-    pub fn initialized_mut(&mut self) -> &mut InitializedVirtualMemoryState {
-        match self {
-            VirtualMemoryState::Uninitialized => {
-                panic!("virtual memory state hasn't been initialized")
-            }
-            VirtualMemoryState::Initialized(i) => i,
-        }
-    }
-}
-
-impl InitializedVirtualMemoryState {
-    fn find_free_address(&self, size: u64) -> VirtAddr {
+    fn find_free_address(&self, size: u64, abi: Abi) -> VirtAddr {
+        assert_ne!(size, 0);
         assert!(
             size < (1 << 47),
             "mapping of size {size:#x} can never exist"
         );
 
         let rdrand = RdRand::new().unwrap();
+        let vm_size = match abi {
+            Abi::I386 => 31,
+            Abi::Amd64 => 47,
+        };
+        let align_mask = (1 << vm_size as usize) - 1;
         const MAX_ATTEMPTS: usize = 64;
         (0..MAX_ATTEMPTS)
             .find_map(|_| {
                 let candidate = rdrand.get_u64()?;
-                let candidate = candidate & ((1 << self.vm_size as usize) - 1);
+                let candidate = candidate & align_mask;
                 let candidate = align_down(candidate, 0x1000);
 
                 let candidate = VirtAddr::new(candidate);
 
-                if self
-                    .mappings
-                    .iter()
-                    .any(|m| m.contains_range(candidate, size))
-                {
+                // Check if there are already pages in the range.
+                let start = Page::containing_address(candidate);
+                let end = Page::containing_address(candidate + (size - 1));
+                if self.pages.range(start..=end).next().is_some() {
                     return None;
                 }
 
@@ -677,24 +568,25 @@ impl InitializedVirtualMemoryState {
             .unwrap()
     }
 
-    fn add_mapping(
+    fn add_mapping2(
         &mut self,
         addr: Option<VirtAddr>,
         len: u64,
         permissions: MemoryPermissions,
         mut backing: Backing,
+        abi: Abi,
     ) -> Result<VirtAddr> {
         assert!(len < (1 << 47), "mapping of size {len:#x} can never exist");
 
-        let addr = addr.unwrap_or_else(|| self.find_free_address(len));
+        let addr = addr.unwrap_or_else(|| self.find_free_address(len, abi));
         let end = addr + len;
 
-        debug!(
-            "adding mapping {:?}-{:?} {:?}",
-            addr,
-            addr + len,
-            permissions
-        );
+        // debug!(
+        // "adding mapping {:?}-{:?} {:?}",
+        // addr,
+        // addr + len,
+        // permissions
+        // );
 
         self.unmap(addr, len);
 
@@ -835,49 +727,10 @@ impl InitializedVirtualMemoryState {
             return;
         }
 
-        debug!("unmapping {addr:?}-{end:?}");
-
-        let mut i = 0;
-        while let Some(mapping) = self.mappings.get_mut(i) {
-            if !mapping.contains_page_range(start, end - start) {
-                i += 1;
-                continue;
-            }
-
-            if mapping.start >= start && mapping.start + mapping.num_pages <= end {
-                for page in mapping.start..mapping.end() {
-                    if entry_for_page(page).is_some() {
-                        let entry = unsafe { unmap_page(page) };
-                        if !entry.cow() {
-                            unsafe {
-                                (&FRAME_ALLOCATOR).deallocate_frame(entry.frame());
-                            }
-                        }
-                    }
-                }
-                self.mappings.swap_remove(i);
-                continue;
-            }
-
-            if start > mapping.start {
-                let offset = start - mapping.start;
-                let new_mapping = mapping.split(offset);
-                self.mappings.push(new_mapping);
-                continue;
-            }
-
-            if mapping.end() > end {
-                let offset = end - mapping.start;
-                let new_mapping = mapping.split(offset);
-                self.mappings.push(new_mapping);
-                continue;
-            }
-
-            unreachable!()
-        }
+        todo!()
     }
 
-    fn brk_mut(&mut self) -> Result<&mut Brk> {
+    fn brk_mut(&mut self, abi: Abi) -> Result<&mut Brk> {
         if self.brk.is_none() {
             let len = 0x1000;
             let start = self.add_mapping(
@@ -885,6 +738,7 @@ impl InitializedVirtualMemoryState {
                 len,
                 MemoryPermissions::READ | MemoryPermissions::WRITE,
                 Backing::Zero,
+                abi,
             )?;
 
             let brk = Brk {
@@ -897,12 +751,12 @@ impl InitializedVirtualMemoryState {
         Ok(self.brk.as_mut().unwrap())
     }
 
-    pub fn brk_end(&mut self) -> Result<VirtAddr> {
-        self.brk_mut().map(|brk| brk.end)
+    pub fn brk_end(&mut self, abi: Abi) -> Result<VirtAddr> {
+        self.brk_mut(abi).map(|brk| brk.end)
     }
 
-    pub fn set_brk_end(&mut self, brk_end: u64) -> Result<VirtAddr> {
-        let brk = self.brk_mut()?;
+    pub fn set_brk_end(&mut self, brk_end: u64, abi: Abi) -> Result<VirtAddr> {
+        let brk = self.brk_mut(abi)?;
         let prev_end = brk.end;
 
         if let Some(grow) = brk_end
@@ -914,6 +768,7 @@ impl InitializedVirtualMemoryState {
                 grow,
                 MemoryPermissions::READ | MemoryPermissions::WRITE,
                 Backing::Zero,
+                abi,
             )?;
         }
 
@@ -925,7 +780,7 @@ impl InitializedVirtualMemoryState {
             self.unmap(VirtAddr::new(brk_end), shrink);
         }
 
-        let brk = self.brk_mut()?;
+        let brk = self.brk_mut(abi)?;
         brk.end = VirtAddr::new(brk_end);
         Ok(brk.end)
     }
@@ -1441,11 +1296,14 @@ fn try_read_user_fast(src: VirtAddr, dest: &mut [u8]) -> Result<(), ()> {
 ///
 /// # Safety
 ///
+/// The caller has to ensure that `src` is safe to read from volatily. Reads
+/// may be racy.
+///
 /// The caller has to ensure writing to `dest` doesn't invalidate any of Rust's
 /// rules.
 #[inline(always)]
-unsafe fn try_write_fast(src: &[u8], dest: VirtAddr) -> Result<(), ()> {
-    if src.is_empty() {
+unsafe fn try_write_fast(src: NonNull<[u8]>, dest: VirtAddr) -> Result<(), ()> {
+    if src.len() == 0 {
         return Ok(());
     }
 
@@ -1459,7 +1317,7 @@ unsafe fn try_write_fast(src: &[u8], dest: VirtAddr) -> Result<(), ()> {
             ".quad 66b",
             ".quad 67b",
             ".popsection",
-            inout("rsi") src.as_ptr() => _,
+            inout("rsi") src.as_ptr() as *const u8 => _,
             inout("rdi") dest.as_u64() => _,
             inout("rcx") src.len() => _,
             inout("rdx") 0u64 => failed,
@@ -1476,9 +1334,14 @@ unsafe fn try_write_fast(src: &[u8], dest: VirtAddr) -> Result<(), ()> {
 ///
 /// If the write fails for some reason `Err(())` is returned. If `src` isn't
 /// user memory `Err(())` is returned.
+///
+/// # Safety
+///
+/// The caller has to ensure that `src` is safe to read from volatily. Reads
+/// may be racy.
 #[inline(always)]
-fn try_write_user_fast(src: &[u8], dest: VirtAddr) -> Result<(), ()> {
-    if src.is_empty() {
+unsafe fn try_write_user_fast(src: NonNull<[u8]>, dest: VirtAddr) -> Result<(), ()> {
+    if src.len() == 0 {
         return Ok(());
     }
 

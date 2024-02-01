@@ -64,6 +64,7 @@ dependencies = [
 ]
 
 [tasks.build-kernel-development]
+# toolchain = "debug"
 extend = "cargo"
 condition = { profiles = ["development"] }
 args = [

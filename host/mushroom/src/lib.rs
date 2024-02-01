@@ -457,6 +457,10 @@ impl VmContext {
                 // Run the AP.
                 let res = ap.run();
 
+                if res.is_err() {
+                    tracing::info!("End");
+                }
+
                 res.unwrap();
 
                 // Check the exit.
@@ -470,6 +474,7 @@ impl VmContext {
                         std::thread::park();
                     }
                     exit => {
+                        tracing::info!("End");
                         panic!("unexpected exit {exit:?}");
                     }
                 }

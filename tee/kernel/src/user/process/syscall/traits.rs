@@ -141,7 +141,7 @@ impl SyscallHandlers {
         };
 
         let handler = handlers.get(syscall_no).copied().flatten().ok_or_else(|| {
-            warn!("unsupported syscall: no={syscall_no}, abi={:?}", args.abi);
+            // warn!("unsupported syscall: no={syscall_no}, abi={:?}", args.abi);
             Error::no_sys(())
         })?;
 
@@ -160,12 +160,12 @@ impl SyscallHandlers {
                     vm_activator: RefCell::new(vm_activator),
                 };
 
-                trace!(
-                    "core={} tid={} abi={:?} @ {formatted_syscall} = {res:?}",
-                    PerCpu::get().idx,
-                    guard.tid(),
-                    args.abi,
-                );
+                // trace!(
+                // "core={} tid={} abi={:?} @ {formatted_syscall} = {res:?}",
+                // PerCpu::get().idx,
+                // guard.tid(),
+                // args.abi,
+                // );
             })
             .await;
         }

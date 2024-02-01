@@ -415,14 +415,14 @@ fn mmap(
             assert!(flags.contains(MmapFlags::ANONYMOUS));
             assert_eq!(prot, ProtFlags::READ | ProtFlags::WRITE);
 
-            let addr =
-                vm_activator.activate(&virtual_memory, |vm| vm.allocate_stack(addr, length))?;
+            let addr = vm_activator
+                .activate(&virtual_memory, |vm| vm.allocate_stack(addr, length, abi))?;
 
             Ok(addr.as_u64())
         } else if flags.contains(MmapFlags::ANONYMOUS) {
             let permissions = MemoryPermissions::from(prot);
             let addr = vm_activator.activate(&virtual_memory, |vm| {
-                vm.mmap_zero(addr, length, permissions)
+                vm.mmap_zero(addr, length, permissions, abi)
             })?;
 
             Ok(addr.as_u64())
@@ -498,6 +498,7 @@ fn munmap(
 #[syscall(i386 = 45, amd64 = 12)]
 fn brk(
     vm_activator: &mut VirtualMemoryActivator,
+    abi: Abi,
     #[state] virtual_memory: Arc<VirtualMemory>,
     brk_value: u64,
 ) -> SyscallResult {
@@ -508,10 +509,10 @@ fn brk(
     vm_activator
         .activate(&virtual_memory, |vm| -> Result<_> {
             if brk_value == 0 {
-                return vm.brk_end();
+                return vm.brk_end(abi);
             }
 
-            vm.set_brk_end(brk_value)
+            vm.set_brk_end(brk_value, abi)
         })
         .map(VirtAddr::as_u64)
 }
@@ -1090,6 +1091,10 @@ fn execve(
     argv: Pointer<Pointer<CString>>,
     envp: Pointer<Pointer<CString>>,
 ) -> SyscallResult {
+    if thread.tid() >= 10000 {
+        panic!();
+    }
+
     let mut argv = argv;
     let mut envp = envp;
 
@@ -1121,7 +1126,7 @@ fn execve(
         Result::Ok((pathname, args, envs))
     })?;
 
-    log::info!("execve({pathname:?}, {args:?}, {envs:?})");
+    // log::info!("execve({pathname:?}, {args:?}, {envs:?})");
 
     thread.execve(&pathname, &args, &envs, &mut ctx, vm_activator)?;
 

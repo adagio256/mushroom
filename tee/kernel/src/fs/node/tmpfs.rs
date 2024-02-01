@@ -1,4 +1,4 @@
-use core::cmp;
+use core::{cmp, num::NonZeroUsize, ops::RangeBounds, ptr::copy_nonoverlapping};
 
 use crate::{
     dir_impls,
@@ -7,6 +7,7 @@ use crate::{
         file::{open_file, File},
         FileDescriptor,
     },
+    memory::page::{KernelPage, UserPage},
     spin::mutex::Mutex,
     time::now,
     user::process::syscall::args::OpenFlags,
@@ -278,7 +279,8 @@ pub struct TmpFsFile {
 }
 
 struct TmpFsFileInternal {
-    content: Arc<Cow<'static, [u8]>>,
+    pages: Vec<KernelPage>,
+    size: usize,
     mode: FileMode,
     atime: Timespec,
     mtime: Timespec,
@@ -286,14 +288,15 @@ struct TmpFsFileInternal {
 }
 
 impl TmpFsFile {
-    pub fn new(mode: FileMode, content: &'static [u8]) -> Arc<Self> {
+    pub fn new(mode: FileMode) -> Arc<Self> {
         let now = now();
 
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
             ino: new_ino(),
             internal: Mutex::new(TmpFsFileInternal {
-                content: Arc::new(Cow::Borrowed(content)),
+                pages: Vec::new(),
+                size: 0,
                 mode,
                 atime: now,
                 mtime: now,
@@ -303,11 +306,32 @@ impl TmpFsFile {
     }
 }
 
+impl TmpFsFileInternal {
+    fn reserve(&mut self, size: usize) -> Result<()> {
+        let pages = size.div_ceil(0x1000);
+        let Some(additional) = self
+            .pages
+            .len()
+            .checked_sub(pages)
+            .and_then(NonZeroUsize::new)
+        else {
+            return Ok(());
+        };
+
+        self.pages.reserve(additional.get());
+        for i in 0..additional.get() {
+            self.pages.push(KernelPage::uninit()?);
+        }
+
+        Ok(())
+    }
+}
+
 impl INode for TmpFsFile {
     fn stat(&self) -> Stat {
         let guard = self.internal.lock();
         let mode = FileTypeAndMode::new(FileType::File, guard.mode);
-        let size = guard.content.len() as i64;
+        let size = guard.size as i64;
 
         // FIXME: Fill in more values.
         Stat {
@@ -335,18 +359,45 @@ impl INode for TmpFsFile {
         self.internal.lock().mode = mode;
     }
 
-    fn read_snapshot(&self) -> Result<FileSnapshot> {
-        let content = self.internal.lock().content.clone();
-        Ok(FileSnapshot(content))
+    fn get_page(&self, idx: usize) -> Result<UserPage> {
+        self.internal.lock().pages.get(idx).map(|a| a.clone())
     }
 }
 
 impl File for TmpFsFile {
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
         let guard = self.internal.lock();
-        let slice = guard.content.get(offset..).ok_or(Error::inval(()))?;
-        let len = cmp::min(slice.len(), buf.len());
-        buf[..len].copy_from_slice(&slice[..len]);
+
+        let start = offset;
+        if start > guard.size {
+            return Err(Error::inval(()));
+        }
+        let end = cmp::min(offset + (buf.len() - 1), guard.size);
+        let len = end - start;
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let start_page = start / 4096;
+        let end_page = start.div_ceil(4096);
+        let pages = &guard.pages[start_page..=end_page];
+        for (page, page_offset) in pages.iter().zip((offset & !0xfff..).step_by(0x1000)) {
+            let offset_start = cmp::max(start, page_offset);
+            let offset_end = cmp::min(end, page_offset + 0xfff);
+            let start_idx = offset_start - page_offset;
+            let end_idx = offset_end - page_offset;
+            let pointer_offset = offset_start - start;
+            let content = page.content();
+            let ptr = content.index(start_idx..=end_idx);
+            unsafe {
+                copy_nonoverlapping(
+                    ptr.as_ptr().cast::<u8>(),
+                    buf.as_mut_ptr().add(pointer_offset),
+                    ptr.len(),
+                );
+            }
+        }
+
         Ok(len)
     }
 
@@ -358,25 +409,69 @@ impl File for TmpFsFile {
         len: usize,
     ) -> Result<usize> {
         let guard = self.internal.lock();
-        let slice = guard.content.get(offset..).ok_or(Error::inval(()))?;
-        let len = cmp::min(slice.len(), len);
-        vm.write_bytes(pointer.get(), &slice[..len])?;
+
+        let start = offset;
+        if start > guard.size {
+            return Err(Error::inval(()));
+        }
+        let end = cmp::min(offset + (len - 1), guard.size);
+        let len = end - start;
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let start_page = start / 4096;
+        let end_page = start.div_ceil(4096);
+        let pages = &guard.pages[start_page..=end_page];
+        for (page, page_offset) in pages.iter().zip((offset & !0xfff..).step_by(0x1000)) {
+            let offset_start = cmp::max(start, page_offset);
+            let offset_end = cmp::min(end, page_offset + 0xfff);
+            let start_idx = offset_start - page_offset;
+            let end_idx = offset_end - page_offset;
+            let pointer_offset = offset_start - start;
+            let content = page.content();
+            let ptr = content.index(start_idx..=end_idx);
+            unsafe {
+                vm.write_bytes_volatile(pointer.get() + pointer_offset, ptr)?;
+            }
+        }
+
         Ok(len)
     }
 
     fn write(&self, offset: usize, buf: &[u8]) -> Result<usize> {
-        let mut guard = self.internal.lock();
-        let bytes = Arc::make_mut(&mut guard.content);
-        let bytes = bytes.to_mut();
-
-        // Grow the file to be able to hold at least `offset+buf.len()` bytes.
-        let new_min_len = offset + buf.len();
-        if bytes.len() < new_min_len {
-            bytes.resize(new_min_len, 0);
+        if buf.is_empty() {
+            return Ok(0);
         }
 
-        // Copy the buffer into the file.
-        bytes[offset..][..buf.len()].copy_from_slice(buf);
+        let mut guard = self.internal.lock();
+
+        guard.reserve(offset + buf.len());
+
+        let start = offset;
+        let end = offset + buf.len() - 1;
+
+        let start_page = start / 4096;
+        let end_page = start.div_ceil(4096);
+        let pages = &mut guard.pages[start_page..=end_page];
+        for (page, page_offset) in pages.iter().zip((offset & !0xfff..).step_by(0x1000)) {
+            let offset_start = cmp::max(start, page_offset);
+            let offset_end = cmp::min(end, page_offset + 0xfff);
+            let start_idx = offset_start - page_offset;
+            let end_idx = offset_end - page_offset;
+            let pointer_offset = offset_start - start;
+            let content = page.content_make_mut()?;
+            let ptr = content.index(start_idx..=end_idx);
+            unsafe {
+                copy_nonoverlapping(
+                    buf.as_ptr().add(pointer_offset),
+                    ptr.as_ptr().cast::<u8>(),
+                    ptr.len(),
+                );
+            }
+        }
+
+        guard.size = cmp::max(guard.size, end + 1);
 
         Ok(buf.len())
     }
@@ -389,7 +484,7 @@ impl File for TmpFsFile {
         len: usize,
     ) -> Result<usize> {
         let mut guard = self.internal.lock();
-        let bytes = Arc::make_mut(&mut guard.content);
+        let bytes = Arc::make_mut(&mut guard.pages);
         let bytes = bytes.to_mut();
 
         // Grow the file to be able to hold at least `offset+buf.len()` bytes.
@@ -406,7 +501,7 @@ impl File for TmpFsFile {
 
     fn append(&self, buf: &[u8]) -> Result<usize> {
         let mut guard = self.internal.lock();
-        let bytes = Arc::make_mut(&mut guard.content);
+        let bytes = Arc::make_mut(&mut guard.pages);
         let bytes = bytes.to_mut();
         bytes.extend_from_slice(buf);
         Ok(buf.len())
@@ -419,7 +514,7 @@ impl File for TmpFsFile {
         len: usize,
     ) -> Result<usize> {
         let mut guard = self.internal.lock();
-        let bytes = Arc::make_mut(&mut guard.content);
+        let bytes = Arc::make_mut(&mut guard.pages);
         let bytes = bytes.to_mut();
 
         let prev_len = bytes.len();
@@ -435,17 +530,17 @@ impl File for TmpFsFile {
         let len = usize::try_from(len)?;
 
         let mut guard = self.internal.lock();
-        if guard.content.len() != len {
+        if guard.pages.len() != len {
             if len == 0 {
-                guard.content = Arc::new(Cow::Borrowed(&[]));
-            } else if let Some(content) = Arc::get_mut(&mut guard.content) {
+                guard.pages = Arc::new(Cow::Borrowed(&[]));
+            } else if let Some(content) = Arc::get_mut(&mut guard.pages) {
                 content.to_mut().resize(len, 0);
             } else {
                 let mut content = Vec::with_capacity(len);
-                let copy_len = cmp::min(len, guard.content.len());
-                content.extend(&guard.content[..copy_len]);
+                let copy_len = cmp::min(len, guard.pages.len());
+                content.extend(&guard.pages[..copy_len]);
                 content.resize(len, 0);
-                guard.content = Arc::new(Cow::Owned(content));
+                guard.pages = Arc::new(Cow::Owned(content));
             }
         }
 

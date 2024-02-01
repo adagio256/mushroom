@@ -97,7 +97,7 @@ pub unsafe fn copy_into_frame_slow(frame: PhysFrame, bytes: &[u8; 0x1000]) -> Re
 }
 
 #[inline(always)]
-unsafe fn copy_into_page_direct(src: *const [u8; 4096], dst: *mut [u8; 4096]) {
+pub unsafe fn copy_into_page_direct(src: *const [u8; 4096], dst: *mut [u8; 4096]) {
     assert!(dst.is_aligned_to(32));
 
     if src.is_aligned_to(32) {

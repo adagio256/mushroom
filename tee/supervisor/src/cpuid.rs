@@ -61,7 +61,7 @@ pub fn lookup_provided_cpuid_function(
 
 /// Simulate the CPUID instruction with the given inputs.
 pub fn get_cpuid_value(eax: u32, ecx: u32, xcr0: u64, xss: u64) -> (u32, u32, u32, u32) {
-    trace!("simulating cpuid eax={eax:#x} ecx={ecx} xcr0={xcr0} xss={xss}");
+    // trace!("simulating cpuid eax={eax:#x} ecx={ecx} xcr0={xcr0} xss={xss}");
 
     // Try to find a cpuid function.
     let index = usize::try_from(eax & !0x8000_0000).unwrap();
