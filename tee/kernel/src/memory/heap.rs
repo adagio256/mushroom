@@ -11,9 +11,11 @@ mod huge_allocator;
 
 static HUGE_ALLOCATOR: HugeAllocator<&BitmapFrameAllocator> = HugeAllocator::new(&FRAME_ALLOCATOR);
 
+#[cfg(not(test))]
 #[global_allocator]
 static GLOBAL: Combined<&HugeAllocator<&BitmapFrameAllocator>> = Combined::new(&HUGE_ALLOCATOR);
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: Layout) -> ! {
     panic!("failed to allocate {layout:?}")

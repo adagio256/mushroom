@@ -740,6 +740,33 @@ async fn writev(
     }
     let vlen = usize_from(vlen);
 
+    if false {
+        let bytes = VirtualMemoryActivator::use_from_async(
+            virtual_memory.clone(),
+            move |vm| -> Result<_> {
+                let mut bytes = Vec::with_capacity(4096);
+                let mut vec = vec;
+                for _ in 0..vlen {
+                    let (len, iovec) = vm.read_sized_with_abi(vec, abi)?;
+                    vec = vec.bytes_offset(len);
+                    if iovec.len == 0 {
+                        continue;
+                    }
+                    let mut buf = alloc:: vec![0; usize_from(iovec.len)];
+                    vm.read_bytes(VirtAddr::new(iovec.base), &mut buf)?;
+                    bytes.extend(buf);
+                    // log::debug!("{:?}", core::str::from_utf8(&buf));
+                }
+                Ok(bytes)
+            },
+        )
+        .await?;
+
+        let fd2 = fdtable.get(fd)?;
+        fd2.write_all(&bytes).await?;
+        return Ok(bytes.len() as u64);
+    }
+
     let iovec =
         VirtualMemoryActivator::use_from_async(virtual_memory.clone(), move |vm| -> Result<_> {
             let mut vec = vec;
@@ -1138,7 +1165,7 @@ fn execve(
         Result::Ok((pathname, args, envs))
     })?;
 
-    log::info!("execve({pathname:?}, {args:?}, {envs:?})");
+    // log::info!("execve({pathname:?}, {args:?}, {envs:?})");
 
     thread.execve(&pathname, &args, &envs, &mut ctx, vm_activator)?;
 
@@ -1157,6 +1184,10 @@ fn exit(
     status: u64,
 ) -> SyscallResult {
     let status = status as u8;
+
+    if let Some(vfork_parent) = thread.vfork_done.take() {
+        let _ = vfork_parent.send(());
+    }
 
     thread.close_all_fds();
 

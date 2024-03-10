@@ -4,6 +4,7 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 
 use crate::host::exit;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic_handler(info: &PanicInfo) -> ! {
     let _ = info;

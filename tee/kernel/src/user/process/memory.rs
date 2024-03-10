@@ -57,6 +57,8 @@ use crate::{
     rt::oneshot,
 };
 
+use self::page_map::PageMap;
+
 use super::syscall::{
     args::{
         pointee::{AbiAgnosticPointee, ReadablePointee, WritablePointee},
@@ -64,6 +66,8 @@ use super::syscall::{
     },
     traits::Abi,
 };
+
+mod page_map;
 
 type DynVirtualMemoryOp = Box<dyn FnOnce(&mut VirtualMemoryActivator) + Send>;
 static PENDING_VIRTUAL_MEMORY_OPERATIONS: SegQueue<DynVirtualMemoryOp> = SegQueue::new();
@@ -197,9 +201,12 @@ impl VirtualMemory {
         });
 
         // Clone the backing memory.
-        for (page, user_page) in guard.pages.iter_mut() {
-            let user_page = user_page.get_mut().clone()?;
-            new_state.pages.insert(*page, Mutex::new(user_page));
+        for (page, user_pages) in guard.pages.chunks_mut() {
+            let mut insert_cursor = new_state.pages.insert_many(page);
+            for user_page in user_pages {
+                let user_page = user_page.get_mut().clone()?;
+                insert_cursor.insert(Mutex::new(user_page));
+            }
         }
 
         drop(guard);
@@ -267,7 +274,7 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
 
     pub fn map_page(&self, page: Page, required_flags: PageTableFlags) -> Result<()> {
         let state = self.state.read();
-        let user_page = state.pages.get(&page).ok_or_else(|| Error::fault(()))?;
+        let user_page = state.pages.get(page).ok_or_else(|| Error::fault(()))?;
 
         let mut guard = user_page.lock();
 
@@ -435,7 +442,7 @@ impl<'a, 'b> ActiveVirtualMemory<'a, 'b> {
         let start = Page::containing_address(addr);
         let end = Page::containing_address(addr + (len - 1));
         for page in start..=end {
-            let user_page = state.pages.get(&page).ok_or_else(|| Error::fault(()))?;
+            let user_page = state.pages.get(page).ok_or_else(|| Error::fault(()))?;
 
             let mut guard = user_page.lock();
             guard.set_perms(MemoryPermissions::from(prot));
@@ -473,39 +480,36 @@ impl ActiveVirtualMemoryWriteGuard<'_> {
     ) -> Result<()> {
         check_user_page(page)?;
 
-        match self.guard.pages.entry(page) {
-            Entry::Vacant(entry) => {
-                // Zero out the parts of the page outside of `range`.
-                user_page.zero_range_inv(range)?;
+        if let Some(entry) = self.guard.pages.get_mut(page) {
+            let existing = entry.get_mut();
 
-                entry.insert(Mutex::new(user_page));
-            }
-            Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut().get_mut();
+            // Merge the permissions.
+            existing.set_perms(existing.perms() | user_page.perms());
 
-                // Merge the permissions.
-                existing.set_perms(existing.perms() | user_page.perms());
+            try_unmap_user_page(page);
 
-                // Merge the content with the existing page.
-                if user_page.is_zero_page() {
-                    existing.zero_range(range)?;
-                } else {
-                    try_unmap_user_page(page);
+            // Merge the content with the existing page.
+            if user_page.is_zero_page() {
+                existing.zero_range(range)?;
+            } else {
+                existing.make_mut()?;
+                let existing_ptr = existing.index(range.clone());
 
-                    existing.make_mut()?;
-                    let existing_ptr = existing.index(range.clone());
+                let new_ptr = user_page.index(range);
 
-                    let new_ptr = user_page.index(range);
-
-                    unsafe {
-                        core::intrinsics::volatile_copy_nonoverlapping_memory(
-                            existing_ptr.as_mut_ptr(),
-                            new_ptr.as_mut_ptr(),
-                            existing_ptr.len(),
-                        );
-                    }
+                unsafe {
+                    core::intrinsics::volatile_copy_nonoverlapping_memory(
+                        existing_ptr.as_mut_ptr(),
+                        new_ptr.as_mut_ptr(),
+                        existing_ptr.len(),
+                    );
                 }
             }
+        } else {
+            // Zero out the parts of the page outside of `range`.
+            user_page.zero_range_inv(range)?;
+
+            self.guard.pages.insert(page, Mutex::new(user_page));
         }
 
         Ok(())
@@ -611,14 +615,14 @@ impl ActiveVirtualMemoryWriteGuard<'_> {
 }
 
 struct VirtualMemoryState {
-    pages: BTreeMap<Page, Mutex<UserPage>>,
+    pages: PageMap<Mutex<UserPage>>,
     brk_end: VirtAddr,
 }
 
 impl VirtualMemoryState {
     pub fn new() -> Self {
         Self {
-            pages: BTreeMap::new(),
+            pages: PageMap::new(),
             brk_end: VirtAddr::zero(),
         }
     }
@@ -646,11 +650,11 @@ impl VirtualMemoryState {
                 let candidate = VirtAddr::new(candidate);
 
                 // Check if there are already pages in the range.
-                let start = Page::containing_address(candidate);
-                let end = Page::containing_address(candidate + (size - 1));
-                if self.pages.range(start..=end).next().is_some() {
-                    return None;
-                }
+                // let start = Page::containing_address(candidate);
+                // let end = Page::containing_address(candidate + (size - 1));
+                // if self.pages.range(start..=end).next().is_some() {
+                // return None;
+                // }
 
                 Some(candidate)
             })
@@ -676,15 +680,8 @@ impl VirtualMemoryState {
         // Flush all pages in the range.
         try_unmap_user_pages(pages.clone());
 
-        loop {
-            // Find the next page in the range.
-            let Some((&page, _)) = self.pages.range(pages.clone()).next() else {
-                break;
-            };
-
-            // Remove the page.
-            self.pages.remove(&page);
-        }
+        self.pages
+            .remove_many(start_page, usize_from(end_page - start_page));
     }
 }
 

@@ -1,10 +1,10 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_main, no_std)]
 #![feature(
     abi_x86_interrupt,
     alloc_error_handler,
     allocator_api,
     asm_const,
+    btree_cursors,
     cfg_sanitize,
     const_mut_refs,
     core_intrinsics,
